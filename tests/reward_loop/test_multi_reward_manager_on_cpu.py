@@ -73,6 +73,31 @@ async def reward_uses_named_engine_router(reward_router_address, model_name):
     return {"score": 0.6, "backend": "engine-function"}
 
 
+async def reward_captures_ocr_request(
+    data_source,
+    solution_image,
+    ground_truth,
+    extra_info,
+    reward_router_address,
+    model_name,
+    sampling_params,
+    reward_model_tokenizer=None,
+):
+    del data_source, solution_image, ground_truth, extra_info, reward_model_tokenizer
+    return {
+        "score": 0.5,
+        "request": {
+            "reward_router_address": reward_router_address,
+            "model_name": model_name,
+            "sampling_params": sampling_params,
+        },
+    }
+
+
+async def reward_captures_sampling_params(**kwargs):
+    return {"score": 0.5, "has_sampling_params": "sampling_params" in kwargs}
+
+
 async def reward_uses_native_model(reward_model, ground_truth, solution_image):
     output = await reward_model.infer(prompt=ground_truth, image=solution_image)
     return {"score": output["value"], "backend": "native-function"}
@@ -207,6 +232,106 @@ class TestVisualRewardManagerDefaults:
 
 
 class TestMultiVisualRewardManagerRunSingle:
+    def test_named_engine_preserves_explicit_scorer_sampling_params(self):
+        explicit = {"max_tokens": 7, "temperature": 0.2}
+        config = _make_config(
+            {
+                "ocr": {
+                    "path": DUMMY_REWARDS_PATH,
+                    "name": "reward_captures_ocr_request",
+                    "sampling_params": explicit,
+                }
+            }
+        )
+        config.reward.models = OmegaConf.create(
+            {"ocr": {"backend": "engine", "rollout": {"response_length": 321, "full_determinism": True}}}
+        )
+        manager = MultiVisualRewardManager(config, MagicMock(), compute_score=None)
+        manager.set_reward_executors({"ocr": _EngineRouterClient()}, None)
+
+        result = manager.loop.run_until_complete(manager.run_single(_make_single_data()))
+
+        assert result["reward_extra_info"]["reward/ocr/request"]["sampling_params"] == explicit
+
+    def test_named_engine_sampling_resolves_config_interpolations(self):
+        config = _make_config({"ocr": {"path": DUMMY_REWARDS_PATH, "name": "reward_captures_ocr_request"}})
+        config.reward.reward_model.rollout.response_length = "${data.max_response_length}"
+        config.reward.models = OmegaConf.create(
+            {"ocr": {"backend": "engine", "rollout": {"full_determinism": True, "seed": "${data.seed}"}}}
+        )
+        manager = MultiVisualRewardManager(config, MagicMock(), compute_score=None)
+        manager.set_reward_executors({"ocr": _EngineRouterClient()}, None)
+
+        result = manager.loop.run_until_complete(manager.run_single(_make_single_data()))
+
+        assert result["reward_extra_info"]["reward/ocr/request"]["sampling_params"] == {
+            "max_tokens": config.data.max_response_length,
+            "seed": config.data.seed,
+        }
+
+    def test_named_engine_ocr_request_matches_legacy_sampling_contract(self):
+        legacy_config = _make_config({})
+        legacy_config.reward.reward_model.enable = True
+        legacy_config.reward.reward_model.model_path = "ocr-model"
+        legacy_config.reward.reward_model.rollout.response_length = 32
+        legacy_config.reward.reward_model.rollout.full_determinism = True
+        legacy_config.reward.reward_model.rollout.seed = 123
+        legacy_manager = VisualRewardManager(
+            legacy_config,
+            MagicMock(),
+            reward_captures_ocr_request,
+            reward_router_address="engine-router",
+        )
+
+        named_config = _make_config(
+            {
+                "ocr": {
+                    "model": "ocr_engine",
+                    "path": DUMMY_REWARDS_PATH,
+                    "name": "reward_captures_ocr_request",
+                }
+            }
+        )
+        named_config.reward.models = OmegaConf.create(
+            {
+                "ocr_engine": {
+                    "backend": "engine",
+                    "model_path": "ocr-model",
+                    "rollout": {"response_length": 32, "full_determinism": True, "seed": 123},
+                }
+            }
+        )
+        named_config.reward.reward_model.rollout.response_length = 64
+        named_config.reward.reward_model.rollout.full_determinism = True
+        named_config.reward.reward_model.rollout.seed = 777
+        named_manager = MultiVisualRewardManager(named_config, MagicMock(), compute_score=None)
+        named_manager.set_reward_executors({"ocr_engine": _EngineRouterClient()}, None)
+
+        legacy_result = legacy_manager.loop.run_until_complete(legacy_manager.run_single(_make_single_data()))
+        named_result = named_manager.loop.run_until_complete(named_manager.run_single(_make_single_data()))
+
+        assert named_result["reward_score"] == legacy_result["reward_score"]
+        assert named_result["reward_extra_info"]["reward/ocr"] == legacy_result["reward_score"]
+        assert named_result["reward_extra_info"]["reward/ocr/request"] == legacy_result["reward_extra_info"]["request"]
+
+    def test_named_native_scorer_does_not_receive_engine_sampling_params(self):
+        config = _make_config(
+            {
+                "quality": {
+                    "model": "quality_model",
+                    "path": DUMMY_REWARDS_PATH,
+                    "name": "reward_captures_sampling_params",
+                }
+            }
+        )
+        config.reward.models = OmegaConf.create({"quality_model": {"backend": "native"}})
+        manager = MultiVisualRewardManager(config, MagicMock(), compute_score=None)
+        manager.set_reward_executors(None, {"quality_model": MagicMock(reward_kwargs=MagicMock(return_value={}))})
+
+        result = manager.loop.run_until_complete(manager.run_single(_make_single_data()))
+
+        assert result["reward_extra_info"]["reward/quality/has_sampling_params"] is False
+
     @pytest.mark.parametrize("manager_factory", [_build_visual_latent_manager, _build_latent_multi_manager])
     def test_float_latent_response_is_forwarded_to_reward(self, manager_factory):
         manager = manager_factory()

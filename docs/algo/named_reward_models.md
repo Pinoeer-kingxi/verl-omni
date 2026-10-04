@@ -1,6 +1,6 @@
 # Named Reward Models
 
-Last updated: 09/14/2026
+Last updated: 10/03/2026
 
 This guide describes how to configure and extend named model-backed rewards
 under `reward.models` in `verl-omni`. For the general Reward Loop interface and
@@ -121,6 +121,42 @@ async def compute_score(
 `reward.reward_model.rollout` remains the common engine default. Values under a
 named model's `rollout` override those defaults. A named model's `model_path`
 also overrides the common `reward_model.model_path` fallback.
+
+## SD3.5 V1 OCR recipe
+
+The [SD3.5 V1 synchronous recipe](../../examples/flowgrpo_trainer/sd35/run_sd35_medium_ocr_lora_v1.sh)
+uses `reward.models.ocr` with the engine backend and
+`MultiVisualRewardManager`. It keeps the existing
+`Qwen/Qwen2.5-VL-3B-Instruct` checkpoint and `compute_score_ocr` scorer, with
+weight `1.0` and `required=true`.
+
+Each rollout replica uses one GPU (`tensor_model_parallel_size=1`) and the
+in-process diffusion executor (`distributed_executor_backend=uni`). Its
+shutdown releases the worker's model references without spawning diffusion
+worker processes or allocating their wake semaphores. Replica GPU visibility
+is set in the Ray runtime environment before CUDA-dependent modules are
+imported, so each in-process worker uses its allocated GPU. A thread lock for
+model loading progress avoids named semaphore leftovers when Ray stops the
+replica. The `uni` executor does
+not enforce collective RPC deadlines; multi-GPU replicas require the `mp`
+executor and separate lifecycle validation.
+
+Prepare `data/ocr/sd3/train.parquet` and `data/ocr/sd3/test.parquet` under
+`OCR_WORKSPACE`, then run from the repository root:
+
+```bash
+OCR_WORKSPACE=/path/to/workspace bash examples/flowgrpo_trainer/sd35/run_sd35_medium_ocr_lora_v1.sh \
+  'trainer.logger=[console]'
+```
+
+Caller overrides remain last. Named engine calls forward the response length
+and optional deterministic seed from the model's rollout settings, falling
+back to `reward.reward_model.rollout`. Explicit scorer `sampling_params`
+take precedence, while the scorer retains its other generation defaults.
+
+Explicit terminal engine and actor cleanup applies to the V1 `sync` mode.
+The `separate_async` mode retains its existing exit behavior and requires
+separate lifecycle validation before adopting this cleanup.
 
 ## Model-to-reward binding
 

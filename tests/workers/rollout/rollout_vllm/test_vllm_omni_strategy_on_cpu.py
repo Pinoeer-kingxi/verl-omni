@@ -15,7 +15,7 @@
 from argparse import Namespace
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import torch
@@ -31,6 +31,86 @@ from verl_omni.workers.rollout.vllm_rollout import vllm_omni_async_server as ser
 from verl_omni.workers.rollout.vllm_rollout import vllm_omni_diffusion_strategy as diffusion_strategy_module
 from verl_omni.workers.rollout.vllm_rollout.vllm_omni_ar_strategy import ARStrategy
 from verl_omni.workers.rollout.vllm_rollout.vllm_omni_diffusion_strategy import DiffusionStrategy
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ["uni", "mp"])
+async def test_uni_weight_loading_progress_uses_thread_lock_before_engine_init(monkeypatch, backend):
+    events = []
+    server = object.__new__(server_module.vLLMOmniHttpServer)
+    server._generate_strategy = MagicMock()
+    server.config = SimpleNamespace(disable_log_stats=True)
+    server._server_address = "127.0.0.1"
+    monkeypatch.setattr(server_module.OmniEngineArgs, "from_cli_args", lambda args: object())
+    monkeypatch.setattr(server_module, "asdict", lambda args: {"distributed_executor_backend": backend})
+    monkeypatch.setattr(server_module, "get_non_ephemeral_free_port", lambda *args: 12345)
+    monkeypatch.setattr(server_module.os, "environ", {})
+    monkeypatch.setattr(server_module, "tqdm", SimpleNamespace(set_lock=lambda lock: events.append("lock")))
+    monkeypatch.setattr(server_module, "AsyncOmni", lambda **kwargs: events.append("engine"))
+    monkeypatch.setattr(server_module, "build_app", lambda args: SimpleNamespace(state=object()))
+    monkeypatch.setattr(server_module, "omni_init_app_state", AsyncMock())
+    monkeypatch.setattr(server_module, "run_uvicorn", AsyncMock(return_value=(12345, None)))
+
+    await server.run_server(Namespace())
+
+    assert events == (["lock", "engine"] if backend == "uni" else ["engine"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fail_launch", [False, True])
+async def test_uni_replica_sets_visibility_in_ray_options(monkeypatch, fail_launch):
+    captured = {}
+
+    async def worker_call(callback):
+        return "4"
+
+    def actor_options(**kwargs):
+        captured.update(kwargs)
+
+    async def parent_launch(replica):
+        replica.server_class.options(runtime_env={"env_vars": {"EXISTING": "preserved"}}, name="replica")
+        if fail_launch:
+            raise RuntimeError("launch failed")
+
+    monkeypatch.setattr(server_module.vLLMReplica, "launch_servers", parent_launch)
+    monkeypatch.setattr(server_module, "get_visible_devices_keyword", lambda: "CUDA_VISIBLE_DEVICES")
+    replica = object.__new__(server_module.vLLMOmniReplica)
+    replica.config = SimpleNamespace(engine_kwargs={"vllm_omni": {"distributed_executor_backend": "uni"}})
+    replica.world_size = 1
+    replica.workers = [SimpleNamespace(__ray_call__=SimpleNamespace(remote=worker_call))]
+    actor_class = SimpleNamespace(options=actor_options)
+    replica.server_class = actor_class
+
+    if fail_launch:
+        with pytest.raises(RuntimeError, match="launch failed"):
+            await replica.launch_servers()
+    else:
+        await replica.launch_servers()
+
+    assert captured["runtime_env"]["env_vars"] == {"EXISTING": "preserved", "CUDA_VISIBLE_DEVICES": "4"}
+    assert captured["name"] == "replica"
+    assert replica.server_class is actor_class
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", [None, "mp"])
+async def test_non_uni_replica_keeps_parent_launch(monkeypatch, backend):
+    parent_launch = AsyncMock()
+    monkeypatch.setattr(server_module.vLLMReplica, "launch_servers", parent_launch)
+    replica = object.__new__(server_module.vLLMOmniReplica)
+    replica.config = SimpleNamespace(engine_kwargs={"vllm_omni": {"distributed_executor_backend": backend}})
+    await replica.launch_servers()
+    parent_launch.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_uni_replica_rejects_multi_gpu_topology():
+    replica = object.__new__(server_module.vLLMOmniReplica)
+    replica.config = SimpleNamespace(engine_kwargs={"vllm_omni": {"distributed_executor_backend": "uni"}})
+    replica.world_size = 2
+    replica.workers = [object(), object()]
+    with pytest.raises(ValueError, match="one GPU per rollout replica"):
+        await replica.launch_servers()
 
 
 @pytest.mark.parametrize(

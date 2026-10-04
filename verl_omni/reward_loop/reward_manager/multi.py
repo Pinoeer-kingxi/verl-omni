@@ -15,6 +15,7 @@
 
 import inspect
 import logging
+from collections import ChainMap
 
 from verl import DataProto
 from verl.utils.import_utils import load_extern_object
@@ -22,7 +23,7 @@ from verl.utils.import_utils import load_extern_object
 from verl_omni.workers.config.reward import get_reward_model_entries, resolve_reward_model_name
 
 from .media import _reward_extra_info
-from .visual import VisualRewardManager, _validate_visual_response
+from .visual import VisualRewardManager, _sampling_params_from_rollout, _validate_visual_response
 
 logger = logging.getLogger(__name__)
 
@@ -136,6 +137,14 @@ class MultiVisualRewardManager(VisualRewardManager):
         self._engine_reward_executors = engine_reward_executors or {}
         self._native_reward_executors = native_reward_executors or {}
 
+    def _sampling_params(self, model_name):
+        """Keep named engine calls aligned with the legacy visual manager."""
+        rollout = self.config.reward.reward_model.get("rollout") or {}
+        if model_name is not None:
+            model = get_reward_model_entries(self.config).get(model_name, {})
+            rollout = ChainMap(model.get("rollout") or {}, rollout)
+        return _sampling_params_from_rollout(rollout)
+
     async def run_single(self, data: DataProto) -> dict:
         assert len(data) == 1, "Only support single data item"
         data_item = data[0]
@@ -155,6 +164,7 @@ class MultiVisualRewardManager(VisualRewardManager):
                 "reward_router_address": self.reward_router_address,
                 "reward_model_tokenizer": self.reward_model_tokenizer,
                 "model_name": self.config.reward.reward_model.model_path,
+                "sampling_params": self._sampling_params(None),
             }
             if self.reward_router_address is not None
             else {}
@@ -188,7 +198,10 @@ class MultiVisualRewardManager(VisualRewardManager):
 
             if model_name is not None:
                 executor = self._engine_reward_executors.get(model_name)
-                if executor is None:
+                if executor is not None:
+                    if "sampling_params" not in extra_args:
+                        sub_kwargs["sampling_params"] = self._sampling_params(model_name)
+                else:
                     executor = self._native_reward_executors.get(model_name)
                 if executor is None:
                     raise RuntimeError(f"Reward model {model_name!r} is not available in this worker")
