@@ -35,7 +35,9 @@ accelerator_workers:
 reward_functions: {}
 
 # Named reward models. See docs/algo/named_reward_models.md for configuration
-# and extension instructions.
+# and extension instructions. Native models may set
+# placement.resource=cpu to use ordinary Ray CPU actors without a reward GPU
+# pool; accelerator placement remains the default for compatibility.
 models: {}
 
 # Aggregation method for multi-reward. Only "weighted_sum" is supported.

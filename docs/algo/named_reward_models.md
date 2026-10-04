@@ -1,6 +1,6 @@
 # Named Reward Models
 
-Last updated: 09/14/2026
+Last updated: 10/03/2026
 
 This guide describes how to configure and extend named model-backed rewards
 under `reward.models` in `verl-omni`. For the general Reward Loop interface and
@@ -244,6 +244,54 @@ Future FSDP support will need an explicit replica-group schema because a flat
 device list cannot distinguish full replicas from ranks within one sharded
 replica.
 
+## Use native on CPU
+
+Small native reward executors can run as ordinary Ray CPU actors without
+allocating a trainer GPU pool. Set `placement.resource=cpu`; `devices` remain
+stable logical replica slots and `cpus_per_worker` reserves the requested CPU
+capacity for each replica:
+
+```yaml
+reward:
+  models:
+    quality:
+      backend: native
+      model_path: /models/quality
+      placement:
+        resource: cpu
+        devices: [0, 1]
+        cpus_per_worker: 2
+      executor:
+        model: my_package.reward_model:CpuRewardModel
+  reward_functions:
+    quality:
+      path: pkg://my_package.reward_score
+      name: compute_quality_score
+```
+
+CPU native models receive `torch.device("cpu")` in their executor unless the
+executor supplies an explicit device. CPU deployments do not consume or split
+the trainer-selected accelerator reward pool, so they can be used alone or
+alongside engine and accelerator-native deployments.
+
+Each scoring phase wakes its worker-local models and, when `offload=true`,
+unloads them after all accepted scoring calls finish. A scoring failure or
+caller cancellation also waits for accepted calls before unloading. With
+`offload=false`, models remain resident; an actor restarted by Ray is initialized
+again at the next scoring phase.
+
+The actual-Ray placement and lifecycle tests start a local cluster and belong
+outside L1. Run them explicitly from the repository root in a dedicated CPU
+integration environment:
+
+```bash
+CUDA_VISIBLE_DEVICES='' PYTHONPATH=.:tests/reward_loop pytest -q --asyncio-mode=auto \
+  tests/reward_loop/test_cpu_native_reward_ray.py
+```
+
+These tests use small test executors without pretrained weights. The existing
+L1 workflow continues to select only `*_on_cpu.py` tests.
+
 ### Wrap a Transformers model for native mode
 
 A Transformers checkpoint does not need an inference server. Add a small model
@@ -411,7 +459,6 @@ through `exp()` again.
 
 - Named-model aggregation currently uses the visual reward manager contract.
 - Native models are replicated; FSDP and tensor parallelism are not supported.
-- CPU-native placement is not supported.
 - Native routing uses a static even split rather than dynamic load balancing.
 - Named models do not participate in streaming reward computation.
 - vLLM-Omni reward serving is not implemented.

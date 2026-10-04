@@ -80,6 +80,17 @@ class OmniRewardLoopWorker(RewardLoopWorker):
                 self.native_reward_executors,
             )
 
+    async def compute_score_batch(self, data: DataProto) -> list[dict]:
+        """Keep sample work inside its RPC lifetime, including on failure."""
+        results = await asyncio.gather(
+            *(self.compute_score(data[index : index + 1]) for index in range(len(data))),
+            return_exceptions=True,
+        )
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+        return results
+
     async def wake_up_reward_model(self, model_name: str) -> None:
         try:
             executor = self.native_reward_executors[model_name]
@@ -244,6 +255,20 @@ class OmniRewardLoopManager(RewardLoopManager):
         ]
 
     def _create_native_workers(self, config, specs, model_name, name_prefix):
+        model = self.multi_reward_model_manager.models[model_name]
+        if model.placement.is_cpu:
+            from .cpu_reward_workers import build_cpu_reward_workers
+
+            placement = model.placement
+            return build_cpu_reward_workers(
+                config=config,
+                reward_loop_workers_class=self.reward_loop_workers_class,
+                reward_model_specs=specs,
+                worker_indices=placement.devices,
+                cpus_per_worker=placement.cpus_per_worker,
+                worker_name_prefix=name_prefix,
+            )
+
         from .accelerator_reward_workers import build_accelerator_reward_workers
 
         resource_pool = self.multi_reward_model_manager.native_resource_pools.get(model_name)
@@ -290,15 +315,36 @@ class OmniRewardLoopManager(RewardLoopManager):
 
     async def _compute_named_model_scores(self, data: DataProto) -> DataProto:
         requests_by_group = {}
-        for group_name, workers in self._reward_worker_groups.items():
-            num_workers = len(workers)
-            padded_data, pad_size = pad_dataproto_to_divisor(data, num_workers)
-            chunks = padded_data.chunk(num_workers)
-            requests = [worker.compute_score_batch.remote(chunk) for worker, chunk in zip(workers, chunks, strict=True)]
-            requests_by_group[group_name] = (requests, pad_size)
+        dispatch_error = None
+        try:
+            for group_name, workers in self._reward_worker_groups.items():
+                num_workers = len(workers)
+                padded_data, pad_size = pad_dataproto_to_divisor(data, num_workers)
+                chunks = padded_data.chunk(num_workers)
+                requests = []
+                requests_by_group[group_name] = (requests, pad_size)
+                for worker, chunk in zip(workers, chunks, strict=True):
+                    requests.append(worker.compute_score_batch.remote(chunk))
+        except Exception as exc:
+            dispatch_error = exc
 
         all_requests = [request for requests, _ in requests_by_group.values() for request in requests]
-        all_outputs = await asyncio.gather(*all_requests)
+        pending = asyncio.gather(*all_requests, return_exceptions=True)
+        cancellation = None
+        while True:
+            try:
+                all_outputs = await asyncio.shield(pending)
+                break
+            except asyncio.CancelledError as exc:
+                # Accepted RPCs still own model state until they finish.
+                cancellation = exc
+        if cancellation is not None:
+            raise cancellation
+        if dispatch_error is not None:
+            raise dispatch_error
+        for output in all_outputs:
+            if isinstance(output, BaseException):
+                raise output
         group_outputs = {}
         offset = 0
         for group_name, (requests, pad_size) in requests_by_group.items():
