@@ -26,7 +26,6 @@ from pathlib import Path
 CUDA_KEYWORD_CHECK_WHITELIST = [
     "verl_omni/workers/engine/fsdp/diffusers_impl.py",  # appear in default device_name
     "verl_omni/trainer/diffusion/ray_diffusion_trainer.py",  # appear in default device_name
-    "verl_omni/trainer/main_diffusion_v1.py",  # terminal CUDA context teardown has no device-agnostic torch API
     "verl_omni/workers/engine/fsdp/omni_impl.py",  # device=[...] registry declaration
     "verl_omni/workers/engine/veomni/diffusion_impl.py",  # device=[...] registry declaration
     "verl_omni/workers/engine/veomni/omni_impl.py",  # CUDA engine registry declaration

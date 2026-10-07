@@ -14,6 +14,7 @@
 """CPU tests for MultiVisualRewardManager."""
 
 import os
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -232,6 +233,110 @@ class TestVisualRewardManagerDefaults:
 
 
 class TestMultiVisualRewardManagerRunSingle:
+    @pytest.mark.parametrize("deterministic", [False, True])
+    @pytest.mark.parametrize("explicit_sampling", [None, {"max_tokens": 17, "seed": 9, "temperature": 0.2}])
+    def test_existing_fallback_ocr_preserves_scorer_defaults_and_overrides(
+        self, monkeypatch, deterministic, explicit_sampling
+    ):
+        from verl_omni.utils.reward_score import genrm_ocr
+
+        requests = []
+
+        async def chat_complete(router_address, chat_complete_request):
+            assert router_address == "engine-router"
+            requests.append(chat_complete_request)
+            return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="hello"))])
+
+        monkeypatch.setenv("GENRM_OCR_SEED", "777")
+        monkeypatch.delenv("GENRM_OCR_MAX_TOKENS", raising=False)
+        monkeypatch.setattr(genrm_ocr, "_chat_complete", chat_complete)
+        entry = {"path": "pkg://verl_omni.utils.reward_score.genrm_ocr", "name": "compute_score_ocr"}
+        if explicit_sampling is not None:
+            entry["sampling_params"] = explicit_sampling
+        config = _make_config({"ocr": entry})
+        config.reward.reward_model.enable = True
+        config.reward.reward_model.model_path = "ocr-model"
+        config.reward.reward_model.rollout.response_length = 2048
+        config.reward.reward_model.rollout.full_determinism = deterministic
+        config.reward.reward_model.rollout.seed = 42
+        manager = MultiVisualRewardManager(
+            config, MagicMock(), compute_score=None, reward_router_address="engine-router"
+        )
+        data = _make_single_data()
+
+        # The original fallback delegated sampling to the scorer and its explicit kwargs.
+        previous = manager.loop.run_until_complete(
+            genrm_ocr.compute_score_ocr(
+                data_source="test_source",
+                solution_image=data[0].batch["responses"],
+                ground_truth="hello",
+                extra_info={},
+                reward_router_address="engine-router",
+                model_name="ocr-model",
+                sampling_params=explicit_sampling,
+            )
+        )
+        current = manager.loop.run_until_complete(manager.run_single(data))
+
+        assert len(requests) == 2
+        assert requests[1] == requests[0]
+        assert requests[0]["max_tokens"] == (4096 if explicit_sampling is None else 17)
+        assert requests[0]["seed"] == (777 if explicit_sampling is None else 9)
+        assert current["reward_score"] == previous["score"] == 1.0
+
+    @pytest.mark.parametrize("deterministic", [False, True])
+    @pytest.mark.parametrize("inherit", [False, True])
+    def test_existing_named_ocr_preserves_scorer_defaults_unless_recipe_opts_in(
+        self, monkeypatch, deterministic, inherit
+    ):
+        from verl_omni.utils.reward_score import genrm_ocr
+
+        requests = []
+
+        async def chat_complete(router_address, chat_complete_request):
+            requests.append(chat_complete_request)
+            return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="test"))])
+
+        monkeypatch.setenv("GENRM_OCR_SEED", "777")
+        monkeypatch.delenv("GENRM_OCR_MAX_TOKENS", raising=False)
+        monkeypatch.setattr(genrm_ocr, "_chat_complete", chat_complete)
+        entry = {"path": "pkg://verl_omni.utils.reward_score.genrm_ocr", "name": "compute_score_ocr"}
+        if inherit:
+            entry["use_rollout_sampling_params"] = True
+        config = _make_config({"ocr": entry})
+        config.reward.reward_model.rollout.response_length = 2048
+        config.reward.reward_model.rollout.full_determinism = deterministic
+        config.reward.reward_model.rollout.seed = 42
+        config.reward.models = OmegaConf.create({"ocr": {"backend": "engine"}})
+        manager = MultiVisualRewardManager(config, MagicMock(), compute_score=None)
+        manager.set_reward_executors({"ocr": _EngineRouterClient()}, None)
+        data = _make_single_data()
+
+        # The original named path passed router/model only, leaving sampling to the scorer.
+        item = data[0]
+        manager.loop.run_until_complete(
+            genrm_ocr.compute_score_ocr(
+                data_source="test",
+                solution_image=item.batch["responses"],
+                ground_truth="test",
+                extra_info={},
+                reward_router_address="engine-router",
+                model_name="ocr-model",
+            )
+        )
+        manager.loop.run_until_complete(manager.run_single(data))
+        previous, current = requests
+        assert previous["max_tokens"] == 4096
+        assert previous["seed"] == 777
+        if not inherit:
+            assert current == previous
+        else:
+            assert current["max_tokens"] == 2048
+            if deterministic:
+                assert current["seed"] == 42
+            else:
+                assert "seed" not in current
+
     def test_named_engine_preserves_explicit_scorer_sampling_params(self):
         explicit = {"max_tokens": 7, "temperature": 0.2}
         config = _make_config(
@@ -240,6 +345,7 @@ class TestMultiVisualRewardManagerRunSingle:
                     "path": DUMMY_REWARDS_PATH,
                     "name": "reward_captures_ocr_request",
                     "sampling_params": explicit,
+                    "use_rollout_sampling_params": True,
                 }
             }
         )
@@ -254,7 +360,15 @@ class TestMultiVisualRewardManagerRunSingle:
         assert result["reward_extra_info"]["reward/ocr/request"]["sampling_params"] == explicit
 
     def test_named_engine_sampling_resolves_config_interpolations(self):
-        config = _make_config({"ocr": {"path": DUMMY_REWARDS_PATH, "name": "reward_captures_ocr_request"}})
+        config = _make_config(
+            {
+                "ocr": {
+                    "path": DUMMY_REWARDS_PATH,
+                    "name": "reward_captures_ocr_request",
+                    "use_rollout_sampling_params": True,
+                }
+            }
+        )
         config.reward.reward_model.rollout.response_length = "${data.max_response_length}"
         config.reward.models = OmegaConf.create(
             {"ocr": {"backend": "engine", "rollout": {"full_determinism": True, "seed": "${data.seed}"}}}
@@ -287,6 +401,7 @@ class TestMultiVisualRewardManagerRunSingle:
             {
                 "ocr": {
                     "model": "ocr_engine",
+                    "use_rollout_sampling_params": True,
                     "path": DUMMY_REWARDS_PATH,
                     "name": "reward_captures_ocr_request",
                 }

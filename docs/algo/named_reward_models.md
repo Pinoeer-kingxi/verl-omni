@@ -1,6 +1,6 @@
 # Named Reward Models
 
-Last updated: 10/03/2026
+Last updated: 10/06/2026
 
 This guide describes how to configure and extend named model-backed rewards
 under `reward.models` in `verl-omni`. For the general Reward Loop interface and
@@ -130,17 +130,6 @@ uses `reward.models.ocr` with the engine backend and
 `Qwen/Qwen2.5-VL-3B-Instruct` checkpoint and `compute_score_ocr` scorer, with
 weight `1.0` and `required=true`.
 
-Each rollout replica uses one GPU (`tensor_model_parallel_size=1`) and the
-in-process diffusion executor (`distributed_executor_backend=uni`). Its
-shutdown releases the worker's model references without spawning diffusion
-worker processes or allocating their wake semaphores. Replica GPU visibility
-is set in the Ray runtime environment before CUDA-dependent modules are
-imported, so each in-process worker uses its allocated GPU. A thread lock for
-model loading progress avoids named semaphore leftovers when Ray stops the
-replica. The `uni` executor does
-not enforce collective RPC deadlines; multi-GPU replicas require the `mp`
-executor and separate lifecycle validation.
-
 Prepare `data/ocr/sd3/train.parquet` and `data/ocr/sd3/test.parquet` under
 `OCR_WORKSPACE`, then run from the repository root:
 
@@ -149,14 +138,14 @@ OCR_WORKSPACE=/path/to/workspace bash examples/flowgrpo_trainer/sd35/run_sd35_me
   'trainer.logger=[console]'
 ```
 
-Caller overrides remain last. Named engine calls forward the response length
-and optional deterministic seed from the model's rollout settings, falling
-back to `reward.reward_model.rollout`. Explicit scorer `sampling_params`
-take precedence, while the scorer retains its other generation defaults.
-
-Explicit terminal engine and actor cleanup applies to the V1 `sync` mode.
-The `separate_async` mode retains its existing exit behavior and requires
-separate lifecycle validation before adopting this cleanup.
+Caller overrides remain last. This recipe opts into
+`reward.reward_functions.ocr.use_rollout_sampling_params=true` to forward the
+response length and optional deterministic seed from the model's rollout
+settings, falling back to `reward.reward_model.rollout`. Explicit scorer
+`sampling_params` take precedence. Existing named rewards without this opt-in
+keep their scorer defaults; OCR still defaults to 4096 output tokens and honors
+`GENRM_OCR_SEED`. The opt-in preserves the legacy visual manager's seed behavior:
+an environment seed is excluded unless rollout determinism supplies a seed.
 
 ## Model-to-reward binding
 

@@ -33,7 +33,7 @@ def test_sd35_v1_ocr_recipe_composes_named_engine_model(tmp_path, executor_overr
     overrides = ["trainer.logger=[console]"]
     if executor_override is not None:
         overrides.append(
-            f"actor_rollout_ref.rollout.engine_kwargs.vllm_omni.distributed_executor_backend={executor_override}"
+            f"++actor_rollout_ref.rollout.engine_kwargs.vllm_omni.distributed_executor_backend={executor_override}"
         )
     result = subprocess.run(
         [
@@ -64,12 +64,14 @@ def test_sd35_v1_ocr_recipe_composes_named_engine_model(tmp_path, executor_overr
     assert config.reward.reward_manager.name == "MultiVisualRewardManager"
     assert config.reward.reward_functions.ocr.name == "compute_score_ocr"
     assert config.reward.reward_functions.ocr.required is True
+    assert config.reward.reward_functions.ocr.use_rollout_sampling_params is True
     assert config.trainer.use_v1 is True
     assert config.trainer.v1.trainer_mode == "sync"
     assert config.actor_rollout_ref.rollout.tensor_model_parallel_size == 1
-    assert config.actor_rollout_ref.rollout.engine_kwargs.vllm_omni.distributed_executor_backend == (
-        executor_override or "uni"
-    )
+    if executor_override is not None:
+        assert (
+            config.actor_rollout_ref.rollout.engine_kwargs.vllm_omni.distributed_executor_backend == executor_override
+        )
     assert list(config.trainer.logger) == ["console"]
     assert config.data.train_files == str(workspace / "data/ocr/sd3/train.parquet")
 

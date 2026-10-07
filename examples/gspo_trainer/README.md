@@ -13,20 +13,21 @@ Both **GPU** and **NPU** training platforms are supported:
 
 - `examples/gspo_trainer/qwen3_omni/run_qwen3_omni_thinker_gspo_lora_v1.sh`
   — **GPU**, **LoRA (r=32)** on a single node with **4 × H800 80GB**.
-- [`run_qwen3_omni_thinker_gspo_lora_avqa_v1.sh`](qwen3_omni/run_qwen3_omni_thinker_gspo_lora_avqa_v1.sh)
+- [`run_qwen3_omni_thinker_gspo_lora_avqa_v1.sh`](https://github.com/verl-project/verl-omni/blob/main/examples/gspo_trainer/qwen3_omni/run_qwen3_omni_thinker_gspo_lora_avqa_v1.sh)
   — **GPU**, **LoRA (r=32) V1** for text + image + audio AVQA training.
-- [`run_qwen3_omni_thinker_gspo_npu_avqa_v1.sh`](qwen3_omni/run_qwen3_omni_thinker_gspo_npu_avqa_v1.sh)
+- [`run_qwen3_omni_thinker_gspo_npu_avqa_v1.sh`](https://github.com/verl-project/verl-omni/blob/main/examples/gspo_trainer/qwen3_omni/run_qwen3_omni_thinker_gspo_npu_avqa_v1.sh)
   — **NPU**, **full-parameter V1** for text + image + audio AVQA training.
-- [`run_qwen3_omni_thinker_gspo_npu_nextqa_v1.sh`](qwen3_omni/run_qwen3_omni_thinker_gspo_npu_nextqa_v1.sh)
+- [`run_qwen3_omni_thinker_gspo_npu_nextqa_v1.sh`](https://github.com/verl-project/verl-omni/blob/main/examples/gspo_trainer/qwen3_omni/run_qwen3_omni_thinker_gspo_npu_nextqa_v1.sh)
   — **NPU**, **full-parameter V1** for video and soundtrack NExT-QA training.
 
 For the base environment setup, see the [installation guide](../../docs/start/install.md).
 
-For **Megatron full-parameter audio-only RL**, see the
-[AudioMCQ separate-async recipe](qwen3_omni/README.md), including an
-offline toy-model smoke and the configurable full-model run. That path is
-experimental and is not reproducible from the current public pins; the FSDP
-recipes above remain the supported default.
+For **Megatron full-parameter separate-async RL**, see the
+[AudioMCQ and image+audio AVQA recipes](https://github.com/verl-project/verl-omni/blob/main/examples/gspo_trainer/qwen3_omni/README.md). The AudioMCQ
+recipe includes an offline toy-model smoke; the AVQA recipe adds a strict
+train/validation media split. Both are experimental and are not reproducible
+from the current public pins; the FSDP recipes above remain the supported
+default.
 
 ## Installation
 
@@ -616,7 +617,7 @@ binary `<answer>` exact-match reward): `critic/rewards/mean` rose from ~0.73 to
 
 ## VeOmni full-parameter Thinker training
 
-[`run_qwen3_omni_thinker_gspo_veomni.sh`](qwen3_omni/run_qwen3_omni_thinker_gspo_veomni.sh)
+[`run_qwen3_omni_thinker_gspo_veomni.sh`](https://github.com/verl-project/verl-omni/blob/main/examples/gspo_trainer/qwen3_omni/run_qwen3_omni_thinker_gspo_veomni.sh)
 uses VeOmni **0.1.12** (PyPI) with FSDP2 and expert parallelism for the
 actor/reference, and vLLM-Omni for text rollout. Follow the
 [installation guide](../../docs/start/install.md#optional-engine-backends) on

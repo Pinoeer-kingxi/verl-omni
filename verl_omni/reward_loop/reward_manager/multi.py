@@ -74,9 +74,16 @@ class MultiVisualRewardManager(VisualRewardManager):
 
         self._sub_rewards = []
         total_weight = 0.0
-        _reserved_keys = {"path", "name", "weight", "required", "model"}
+        _reserved_keys = {"path", "name", "weight", "required", "model", "use_rollout_sampling_params"}
         for key, entry in reward_functions_cfg.items():
             model_name = resolve_reward_model_name(key, entry, reward_models_cfg)
+            use_rollout_sampling_params = entry.get("use_rollout_sampling_params", False)
+            if not isinstance(use_rollout_sampling_params, bool):
+                raise TypeError("use_rollout_sampling_params must be a boolean")
+            if use_rollout_sampling_params and (
+                model_name is None or reward_models_cfg[model_name].get("backend") != "engine"
+            ):
+                raise ValueError("use_rollout_sampling_params requires a named engine reward model")
             path = entry.get("path")
             name = entry.get("name")
             if (path is None) != (name is None):
@@ -115,6 +122,7 @@ class MultiVisualRewardManager(VisualRewardManager):
                     "is_async": is_async,
                     "extra_args": extra_args,
                     "model": model_name,
+                    "use_rollout_sampling_params": use_rollout_sampling_params,
                 }
             )
             logger.info(
@@ -137,14 +145,6 @@ class MultiVisualRewardManager(VisualRewardManager):
         self._engine_reward_executors = engine_reward_executors or {}
         self._native_reward_executors = native_reward_executors or {}
 
-    def _sampling_params(self, model_name):
-        """Keep named engine calls aligned with the legacy visual manager."""
-        rollout = self.config.reward.reward_model.get("rollout") or {}
-        if model_name is not None:
-            model = get_reward_model_entries(self.config).get(model_name, {})
-            rollout = ChainMap(model.get("rollout") or {}, rollout)
-        return _sampling_params_from_rollout(rollout)
-
     async def run_single(self, data: DataProto) -> dict:
         assert len(data) == 1, "Only support single data item"
         data_item = data[0]
@@ -164,7 +164,6 @@ class MultiVisualRewardManager(VisualRewardManager):
                 "reward_router_address": self.reward_router_address,
                 "reward_model_tokenizer": self.reward_model_tokenizer,
                 "model_name": self.config.reward.reward_model.model_path,
-                "sampling_params": self._sampling_params(None),
             }
             if self.reward_router_address is not None
             else {}
@@ -199,8 +198,12 @@ class MultiVisualRewardManager(VisualRewardManager):
             if model_name is not None:
                 executor = self._engine_reward_executors.get(model_name)
                 if executor is not None:
-                    if "sampling_params" not in extra_args:
-                        sub_kwargs["sampling_params"] = self._sampling_params(model_name)
+                    if sub["use_rollout_sampling_params"] and "sampling_params" not in extra_args:
+                        model = get_reward_model_entries(self.config)[model_name]
+                        rollout = ChainMap(
+                            model.get("rollout") or {}, self.config.reward.reward_model.get("rollout") or {}
+                        )
+                        sub_kwargs["sampling_params"] = _sampling_params_from_rollout(rollout)
                 else:
                     executor = self._native_reward_executors.get(model_name)
                 if executor is None:
