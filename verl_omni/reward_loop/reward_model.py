@@ -260,6 +260,7 @@ class NativeManagedRewardModel(ManagedRewardModel):
             offload=offload,
         )
         self._workers = None
+        self._worker_process_identities = {}
 
     def bind_workers(self, workers) -> None:
         self._workers = list(workers)
@@ -268,7 +269,11 @@ class NativeManagedRewardModel(ManagedRewardModel):
         if self._workers is None:
             raise RuntimeError(f"Native reward model {self.name!r} has no bound workers")
         refs = [getattr(worker, method).remote(self.name) for worker in self._workers]
-        await asyncio.gather(*refs)
+        results = await asyncio.gather(*refs)
+        if method == "wake_up_reward_model":
+            self._worker_process_identities = {
+                id(worker): identity for worker, identity in zip(self._workers, results, strict=True)
+            }
 
     async def wake_up(self) -> None:
         # The worker-side executor makes wake_up idempotent. Always send the

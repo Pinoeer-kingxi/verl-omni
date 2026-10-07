@@ -14,6 +14,7 @@
 """CPU-native reward placement and executor contracts."""
 
 import asyncio
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -21,8 +22,10 @@ import torch
 from omegaconf import OmegaConf
 from verl import DataProto
 
+from verl_omni.reward_loop import reward_loop as loop_module
 from verl_omni.reward_loop import reward_model_executor as executor_module
 from verl_omni.reward_loop.reward_loop import OmniRewardLoopManager
+from verl_omni.reward_loop.reward_model import NativeManagedRewardModel
 from verl_omni.reward_loop.reward_model_executor import NativeRewardExecutor
 from verl_omni.workers.config.reward import RewardModelSpec, parse_reward_model_config, reward_role_required
 
@@ -182,3 +185,150 @@ async def test_cpu_phase_submission_failure_drains_accepted_rpc_before_sleep():
     assert isinstance(result, ValueError)
     assert "intentional RPC submission failure" in str(result)
     assert calls == ["wake_up", "score_finished", "sleep"]
+
+
+def test_shared_worker_identity_is_recorded_before_native_cpus_are_reserved(monkeypatch):
+    model_config = {
+        "backend": "native",
+        "placement": {"resource": "cpu", "devices": [0]},
+        "executor": {"model": "tests.fake:CpuModel"},
+    }
+    model = NativeManagedRewardModel("quality", model_config)
+    config = OmegaConf.create(
+        {
+            "reward": {
+                "num_workers": 1,
+                "models": {"quality": model_config},
+                "reward_functions": {
+                    "quality": {"path": "tests.fake.py", "name": "quality"},
+                    "rule": {"path": "tests.fake.py", "name": "rule"},
+                },
+                "reward_model": {"enable": False},
+            }
+        }
+    )
+    calls = []
+    identity = {"pid": 17, "created": 23.0, "node_id": "owned-node"}
+
+    def capture(callback):
+        calls.append("shared_identity")
+        return identity
+
+    shared = SimpleNamespace(__ray_call__=SimpleNamespace(remote=capture))
+
+    def reserve_native(*args):
+        calls.append("native_cpu_reserved")
+        return [object()]
+
+    manager = object.__new__(OmniRewardLoopManager)
+    manager.config = config
+    manager.reward_router_address = None
+    manager.multi_reward_model_manager = SimpleNamespace(
+        models={"quality": model},
+        reward_model_specs={"quality": model.spec},
+        native_device_assignments={"quality": (0,)},
+        bind_native_workers=lambda name, workers: model.bind_workers(workers),
+    )
+    manager._create_node_affinity_workers = lambda *args: [shared]
+    manager._create_native_workers = reserve_native
+    monkeypatch.setattr(loop_module.ray, "remote", lambda cls: cls)
+    monkeypatch.setattr(loop_module.ray, "get", lambda refs: refs)
+    manager._init_reward_loop_workers()
+    assert calls == ["shared_identity", "native_cpu_reserved"]
+    assert manager._shared_worker_process_identities == {id(shared): identity}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("trigger", ["cancel", "timeout", "rpc_error", "submission_error"])
+@pytest.mark.parametrize("confirmed", [False, True])
+async def test_never_returning_rpc_has_bounded_cleanup_and_retains_model_until_stopped(monkeypatch, trigger, confirmed):
+    calls = []
+    entered = asyncio.Event()
+    request = None
+
+    async def score(data):
+        entered.set()
+        await asyncio.Event().wait()
+
+    def submit(data):
+        nonlocal request
+        request = asyncio.create_task(score(data))
+        return request
+
+    async def failed(data):
+        raise ValueError("scoring failed")
+
+    def failed_submit(data):
+        raise ValueError("submission failed")
+
+    worker = SimpleNamespace(compute_score_batch=SimpleNamespace(remote=submit))
+    workers = [worker]
+    if trigger not in ("cancel", "timeout"):
+        workers.append(
+            SimpleNamespace(
+                compute_score_batch=SimpleNamespace(remote=failed if trigger == "rpc_error" else failed_submit)
+            )
+        )
+    model = NativeManagedRewardModel(
+        "quality",
+        {
+            "backend": "native",
+            "placement": {"resource": "cpu", "devices": [0]},
+            "executor": {"model": "tests.fake:CpuModel"},
+        },
+    )
+    model.bind_workers(workers)
+    model._worker_process_identities[id(worker)] = {"owned": True}
+
+    async def wake():
+        pass
+
+    async def sleep():
+        assert calls == ["terminate", "stopped"]
+        assert worker not in model._workers
+        calls.append("sleep")
+
+    def terminate(actor, identity, timeout):
+        assert actor is worker
+        assert identity == {"owned": True}
+        calls.append("terminate")
+        time.sleep(0.005)
+        if not confirmed:
+            raise TimeoutError("worker termination unconfirmed")
+        calls.append("stopped")
+
+    monkeypatch.setattr(loop_module, "_SCORING_DRAIN_TIMEOUT", 0.02)
+    monkeypatch.setattr(loop_module, "terminate_actor_and_wait", terminate)
+    manager = object.__new__(OmniRewardLoopManager)
+    manager._score_lock = asyncio.Lock()
+    manager._reward_worker_groups = {"quality": workers}
+    manager.multi_reward_model_manager = SimpleNamespace(
+        models={"quality": model},
+        wake_up=wake,
+        sleep=sleep,
+        has_engine_model=False,
+    )
+    operation = manager.async_compute_rm_score(DataProto.from_dict(tensors={"id": torch.arange(2)}))
+    scoring = asyncio.create_task(asyncio.wait_for(operation, timeout=0.02) if trigger == "timeout" else operation)
+    await asyncio.wait_for(entered.wait(), timeout=0.5)
+    started = time.monotonic()
+    if trigger == "cancel":
+        scoring.cancel()
+        await asyncio.sleep(0.005)
+        scoring.cancel()
+    completed, _ = await asyncio.wait({scoring}, timeout=0.25)
+    assert completed, "Cleanup deadline must bound a scoring RPC that never returns"
+    result = (await asyncio.gather(scoring, return_exceptions=True))[0]
+    assert time.monotonic() - started < 0.25
+    assert not manager._score_lock.locked()
+    assert request.cancelled()
+    if confirmed:
+        assert calls == ["terminate", "stopped", "sleep"]
+        expected_error = {"cancel": asyncio.CancelledError, "timeout": TimeoutError}.get(trigger, ValueError)
+        assert isinstance(result, expected_error)
+    else:
+        assert calls == ["terminate"]
+        assert isinstance(result, RuntimeError)
+        assert "termination could not be confirmed" in str(result)
+    with pytest.raises(RuntimeError, match="recreate the reward manager"):
+        await manager.async_compute_rm_score(DataProto.from_dict(tensors={"id": torch.arange(2)}))

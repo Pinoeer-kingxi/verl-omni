@@ -1,6 +1,6 @@
 # Named Reward Models
 
-Last updated: 10/03/2026
+Last updated: 10/05/2026
 
 This guide describes how to configure and extend named model-backed rewards
 under `reward.models` in `verl-omni`. For the general Reward Loop interface and
@@ -276,21 +276,17 @@ alongside engine and accelerator-native deployments.
 
 Each scoring phase wakes its worker-local models and, when `offload=true`,
 unloads them after all accepted scoring calls finish. A scoring failure or
-caller cancellation also waits for accepted calls before unloading. With
-`offload=false`, models remain resident; an actor restarted by Ray is initialized
-again at the next scoring phase.
+caller cancellation waits up to 30 seconds for accepted calls to finish. If
+calls remain stuck, cleanup has a separate 30-second worker termination
+deadline and confirms the owned actor and subprocesses stopped before unloading.
+Unconfirmed termination raises a cleanup error and skips model unloading.
+Forced termination requires recreating the reward manager; it does not retry
+scoring. Model sleep has a 30-second deadline as well. Repeated cancellation
+does not extend these deadlines.
 
-The actual-Ray placement and lifecycle tests start a local cluster and belong
-outside L1. Run them explicitly from the repository root in a dedicated CPU
-integration environment:
-
-```bash
-CUDA_VISIBLE_DEVICES='' PYTHONPATH=.:tests/reward_loop pytest -q --asyncio-mode=auto \
-  tests/reward_loop/test_cpu_native_reward_ray.py
-```
-
-These tests use small test executors without pretrained weights. The existing
-L1 workflow continues to select only `*_on_cpu.py` tests.
+With `offload=false`, models remain resident. If a deployment explicitly enables
+Ray actor restarts, the next scoring phase initializes a restarted actor again.
+Production worker creation does not enable automatic restarts.
 
 ### Wrap a Transformers model for native mode
 

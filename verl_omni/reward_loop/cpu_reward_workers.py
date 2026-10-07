@@ -15,15 +15,24 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Sequence
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from omegaconf import DictConfig
+    from ray.actor import ActorClass, ActorHandle
+
+    from verl_omni.workers.config.reward import RewardModelSpec
+
 
 def build_cpu_reward_workers(
-    config,
-    reward_loop_workers_class,
-    reward_model_specs,
-    worker_indices,
-    cpus_per_worker,
-    worker_name_prefix,
-):
+    config: DictConfig,
+    reward_loop_workers_class: ActorClass,
+    reward_model_specs: Sequence[RewardModelSpec],
+    worker_indices: Iterable[int],
+    cpus_per_worker: float,
+    worker_name_prefix: str,
+) -> list[ActorHandle]:
     """Create one Ray reward actor per configured CPU replica.
 
     CPU native deployments do not borrow the trainer's accelerator resource
