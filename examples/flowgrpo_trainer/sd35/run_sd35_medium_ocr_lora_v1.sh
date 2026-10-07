@@ -88,6 +88,7 @@ python3 -m verl_omni.trainer.main_diffusion_v1 \
     actor_rollout_ref.rollout.algo.sde_type="cps" \
     actor_rollout_ref.rollout.algo.sde_window_size=3 \
     actor_rollout_ref.rollout.algo.sde_window_range="[0,5]" \
+    +actor_rollout_ref.rollout.engine_kwargs.vllm_omni.distributed_executor_backend=uni \
     +actor_rollout_ref.rollout.engine_kwargs.vllm_omni.max_num_seqs=$MAX_NUM_SEQS \
     actor_rollout_ref.rollout.val_kwargs.pipeline.num_inference_steps=28 \
     actor_rollout_ref.rollout.val_kwargs.algo.noise_level=0.0 \

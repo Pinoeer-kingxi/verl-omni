@@ -1,6 +1,6 @@
 # Diffusion V1 training
 
-Last updated: 09/28/2026
+Last updated: 10/06/2026
 
 This guide runs the diffusion V1 trainer in synchronous or separate-asynchronous
 mode using the provided Stable Diffusion 3.5 Medium FlowGRPO OCR recipes.
@@ -100,6 +100,35 @@ Checkpoints are written by default to:
 ```text
 checkpoints/flow_grpo/sd35_medium_ocr_lora_v1
 ```
+
+### Sync shutdown and rollout placement
+
+When V1 sync training ends, the trainer closes owned HTTP listeners and
+application lifespan before shutting down inference engines. If engine
+shutdown fails or times out, it terminates the owned serving actor and its
+subprocesses and confirms their exit before training workers release CUDA
+IPC resources. If consumer exit cannot be confirmed, cleanup reports failure
+and retains those resources. Incomplete trainer initialization also skips
+producer IPC cleanup. The `separate_async` mode keeps its existing exit path.
+
+Ordinary vLLM workers release model resources through a bounded collective
+RPC before engine shutdown starts the process-exit grace period. RPC failure
+or timeout follows the same termination and exit-confirmation path.
+
+Exit confirmation covers local `mp` and `uni` executors. Ray, external or
+custom executors and custom Omni stage deployments can own consumers outside
+the serving actor's process tree. Cleanup still closes the known serving
+actors, but reports failure and skips producer IPC cleanup for these
+configurations. Other engine backends also require separate exit confirmation.
+
+The SD3.5 sync recipe selects the in-process `uni` diffusion executor, with
+one GPU per rollout replica. Its serving actor receives GPU visibility in
+the Ray runtime environment before CUDA-dependent modules are imported;
+setting visibility in the actor constructor can happen after CUDA has
+initialized. Model-loading progress uses a thread lock to avoid allocating
+named multiprocessing semaphores. The `uni` executor does not enforce
+collective RPC deadlines. Multi-GPU replicas require the `mp` executor and
+separate lifecycle validation.
 
 ### Qwen-Image FlowGRPO
 

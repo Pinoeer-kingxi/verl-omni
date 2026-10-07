@@ -53,7 +53,7 @@ async def _run_server_capture(monkeypatch, engine_args):
         return None
 
     async def _stub_run_uvicorn(*args, **kwargs):
-        return (0, None)
+        return (0, None, None)
 
     monkeypatch.setattr(server_module, "AsyncOmni", _capture_async_omni)
     monkeypatch.setattr(server_module, "build_app", lambda args: MagicMock())

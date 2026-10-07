@@ -15,17 +15,20 @@ import argparse
 import asyncio
 import logging
 import os
+import threading
 from dataclasses import asdict
+from types import SimpleNamespace
 from typing import Any, Optional
 
 import ray
 import torch
 import vllm_omni.entrypoints.cli.serve
+from tqdm import tqdm
+from verl.utils.device import get_resource_name, get_visible_devices_keyword
 from verl.utils.profiler import build_rollout_dist_profiler
 from verl.utils.tracking import RLInsightLogger
 from verl.workers.config import RolloutConfig
 from verl.workers.rollout.replica import RolloutMode, TokenOutput
-from verl.workers.rollout.utils import run_uvicorn
 from verl.workers.rollout.vllm_rollout import ServerAdapter
 from verl.workers.rollout.vllm_rollout.utils import (
     VLLM_LORA_INT_ID,
@@ -42,6 +45,7 @@ from vllm_omni.lora.request import LoRARequest
 from verl_omni.utils.net_utils import get_non_ephemeral_free_port
 from verl_omni.workers.config import DiffusionModelConfig, DiffusionRolloutConfig, OmniModelConfig
 from verl_omni.workers.rollout.base import get_rollout_sequence_parallel_size, get_rollout_world_size
+from verl_omni.workers.rollout.http_server import run_uvicorn
 from verl_omni.workers.rollout.replica import DiffusionOutput
 from verl_omni.workers.rollout.vllm_rollout.vllm_omni_ar_strategy import ARStrategy
 from verl_omni.workers.rollout.vllm_rollout.vllm_omni_diffusion_strategy import DiffusionStrategy
@@ -199,6 +203,9 @@ class vLLMOmniHttpServer(vLLMHttpServer):
                 attn_backend,
             )
 
+        if engine_args.get("distributed_executor_backend") == "uni":
+            # Weight-loading progress only needs a thread lock in this owned in-process executor.
+            tqdm.set_lock(threading.RLock())
         engine_client = AsyncOmni(**engine_args)
         app = build_app(args)
         await omni_init_app_state(engine_client, app.state, args)
@@ -212,7 +219,7 @@ class vLLMOmniHttpServer(vLLMHttpServer):
         if isinstance(self._generate_strategy, ARStrategy):
             # attach engine-level monkey patches
             await self.collective_rpc(method="monkey_patch_model")
-        self._server_port, self._server_task = await run_uvicorn(app, args, self._server_address)
+        self._server_port, self._server_task, self._http_server = await run_uvicorn(app, args, self._server_address)
 
     async def run_headless(self, args: argparse.Namespace):
         """Run headless server in a separate thread."""
@@ -577,6 +584,29 @@ class vLLMOmniReplica(vLLMReplica):
                 raise ValueError(f"Replica size {self.world_size} must be divisible by GPUs per node {gpus_per_node}.")
             self.nnodes = self.world_size // self.gpus_per_replica_node
         self.server_class = ray.remote(vLLMOmniHttpServer)
+
+    async def launch_servers(self):
+        """Set uni replica visibility before Ray imports CUDA-dependent modules."""
+        engine_kwargs = self.config.engine_kwargs.get("vllm_omni", {}) or {}
+        if engine_kwargs.get("distributed_executor_backend") != "uni":
+            return await super().launch_servers()
+        if self.world_size != 1 or len(self.workers) != 1:
+            raise ValueError("The uni diffusion executor requires one GPU per rollout replica.")
+        visible_devices = await self.workers[0].__ray_call__.remote(
+            lambda worker: ray.get_runtime_context().get_accelerator_ids()[get_resource_name()][0]
+        )
+        server_class = self.server_class
+
+        def options(**kwargs):
+            # The parent sets visibility in __init__, after imports may have initialized CUDA.
+            kwargs["runtime_env"]["env_vars"][get_visible_devices_keyword()] = str(visible_devices)
+            return server_class.options(**kwargs)
+
+        self.server_class = SimpleNamespace(options=options)
+        try:
+            await super().launch_servers()
+        finally:
+            self.server_class = server_class
 
     # The rollout worker actor class is verl's default
     # (ray.remote(CheckpointEngineWorker)): the omni_delta_sharded backend
