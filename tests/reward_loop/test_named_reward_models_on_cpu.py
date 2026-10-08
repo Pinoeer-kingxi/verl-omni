@@ -33,7 +33,7 @@ from verl_omni.reward_loop.reward_loop import (
     OmniRewardLoopWorker,
     _validate_named_reward_manager_cls,
 )
-from verl_omni.reward_loop.reward_manager import MultiVisualRewardManager, VisualRewardManager
+from verl_omni.reward_loop.reward_manager import MultiRewardManager, MultiVisualRewardManager, VisualRewardManager
 from verl_omni.reward_loop.reward_model import (
     EngineManagedRewardModel,
     MultiRewardModelManager,
@@ -260,7 +260,8 @@ def test_cpu_native_only_model_does_not_require_parent_pool(monkeypatch):
 
     assert manager.resource_pool is None
     assert manager.native_resource_pools == {}
-    assert manager.models["quality"].placement.resource == "cpu"
+    assert manager.models["quality"].placement.is_cpu
+    assert manager.models["quality"].placement.cpus_per_worker == 2
     assert not reward_role_required(config)
     assert reward_is_enabled(config)
 
@@ -298,10 +299,12 @@ def test_cpu_native_model_is_excluded_from_mixed_accelerator_pool_split(monkeypa
     assert native_pools == {}
 
 
-def test_named_models_require_explicit_multi_visual_reward_manager():
+def test_named_models_require_multi_reward_manager():
     _validate_named_reward_manager_cls(MultiVisualRewardManager)
 
-    with pytest.raises(ValueError, match="currently requires.*MultiVisualRewardManager"):
+    with pytest.raises(ValueError, match="requires a MultiRewardManager subclass"):
+        _validate_named_reward_manager_cls(MultiRewardManager)
+    with pytest.raises(ValueError, match="requires a MultiRewardManager subclass"):
         _validate_named_reward_manager_cls(VisualRewardManager)
 
 

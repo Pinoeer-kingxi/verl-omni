@@ -30,28 +30,6 @@ from verl_omni.reward_loop.reward_model_executor import NativeRewardExecutor
 from verl_omni.workers.config.reward import RewardModelSpec, parse_reward_model_config, reward_role_required
 
 
-def test_cpu_native_schema_does_not_require_reward_gpu_pool():
-    model = parse_reward_model_config(
-        "quality",
-        {
-            "backend": "native",
-            "placement": {"resource": "cpu", "devices": [0], "cpus_per_worker": 2},
-            "executor": {"model": "tests.fake:CpuModel"},
-        },
-    )
-    config = OmegaConf.create(
-        {
-            "reward": {
-                "reward_model": {"enable": False},
-                "models": {"quality": {"backend": "native", "placement": {"resource": "cpu"}}},
-            }
-        }
-    )
-    assert model.placement.is_cpu
-    assert model.placement.cpus_per_worker == 2
-    assert not reward_role_required(config)
-
-
 def test_cpu_native_role_resolves_placement_interpolations():
     config = OmegaConf.create(
         {

@@ -50,12 +50,12 @@ _MODEL_SLEEP_TIMEOUT = 30
 
 
 def _validate_named_reward_manager_cls(reward_manager_cls) -> None:
-    from .reward_manager.multi import MultiVisualRewardManager
+    from .reward_manager.multi import MultiRewardManager
 
-    if not issubclass(reward_manager_cls, MultiVisualRewardManager):
+    if reward_manager_cls is MultiRewardManager or not issubclass(reward_manager_cls, MultiRewardManager):
         raise ValueError(
-            "reward.models currently requires reward.reward_manager.name=MultiVisualRewardManager; "
-            f"got {reward_manager_cls.__name__!r}. Support for other modalities is follow-up work."
+            "reward.models requires a MultiRewardManager subclass with an input contract; "
+            f"got {reward_manager_cls.__name__!r}."
         )
 
 

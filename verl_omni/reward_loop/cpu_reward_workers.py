@@ -15,7 +15,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -28,7 +28,7 @@ if TYPE_CHECKING:
 def build_cpu_reward_workers(
     config: DictConfig,
     reward_loop_workers_class: ActorClass,
-    reward_model_specs: Sequence[RewardModelSpec],
+    reward_model_specs: dict[str, RewardModelSpec],
     worker_indices: Iterable[int],
     cpus_per_worker: float,
     worker_name_prefix: str,
