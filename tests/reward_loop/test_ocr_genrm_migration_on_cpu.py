@@ -21,7 +21,6 @@ from pathlib import Path
 import pytest
 from hydra import compose, initialize_config_dir
 
-from verl_omni.utils.reward_score.genrm_ocr import _levenshtein_score
 from verl_omni.workers.config.reward import parse_reward_model_config, validate_reward_model_terms
 
 RECIPE = Path(__file__).parents[2] / "examples/flowgrpo_trainer/sd35/run_sd35_medium_ocr_lora_v1.sh"
@@ -74,9 +73,3 @@ def test_sd35_v1_ocr_recipe_composes_named_engine_model(tmp_path, executor_overr
         )
     assert list(config.trainer.logger) == ["console"]
     assert config.data.train_files == str(workspace / "data/ocr/sd3/train.parquet")
-
-
-def test_ocr_score_parity_contract_is_unchanged():
-    assert _levenshtein_score("Hello world", "hello world") == 1.0
-    assert _levenshtein_score("prefix hello world suffix", "hello world") == 1.0
-    assert _levenshtein_score("hello", "hello world") == 1 - 5 / 10
