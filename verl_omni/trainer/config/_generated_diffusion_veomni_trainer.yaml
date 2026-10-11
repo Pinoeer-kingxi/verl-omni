@@ -272,7 +272,7 @@ actor_rollout_ref:
     max_num_seqs: 1024
     step_execution: false
     enable_chunked_prefill: true
-    enable_prefix_caching: true
+    enable_prefix_caching: false
     logprobs_mode: processed_logprobs
     scheduling_policy: fcfs
     load_format: dummy

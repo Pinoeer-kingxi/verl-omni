@@ -15,6 +15,7 @@
 
 import asyncio
 import time
+from threading import Event
 from types import SimpleNamespace
 
 import pytest
@@ -25,7 +26,11 @@ from verl import DataProto
 from verl_omni.reward_loop import reward_loop as loop_module
 from verl_omni.reward_loop import reward_model_executor as executor_module
 from verl_omni.reward_loop.reward_loop import OmniRewardLoopManager
-from verl_omni.reward_loop.reward_model import NativeManagedRewardModel
+from verl_omni.reward_loop.reward_model import (
+    EngineManagedRewardModel,
+    MultiRewardModelManager,
+    NativeManagedRewardModel,
+)
 from verl_omni.reward_loop.reward_model_executor import NativeRewardExecutor
 from verl_omni.workers.config.reward import RewardModelSpec, parse_reward_model_config, reward_role_required
 
@@ -43,6 +48,77 @@ def test_cpu_native_role_resolves_placement_interpolations():
     assert not reward_role_required(config)
     config.resource = "accelerator"
     assert reward_role_required(config)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["thread", "async", "awaitable"])
+@pytest.mark.parametrize("trigger", ["cancel", "timeout"])
+async def test_cancelled_native_inference_keeps_model_until_actual_completion(monkeypatch, kind, trigger):
+    entered, release, finished, closed = (Event() for _ in range(4))
+
+    async def async_infer(self, value):
+        entered.set()
+        try:
+            async with asyncio.timeout(3):
+                while not release.is_set():
+                    await asyncio.sleep(0.001)
+            return value + 1
+        finally:
+            finished.set()
+
+    class Model:
+        def __init__(self, **kwargs):
+            del kwargs
+
+        def infer(self, value):
+            if kind == "awaitable":
+                return async_infer(self, value)
+            entered.set()
+            try:
+                if not release.wait(3):
+                    raise TimeoutError("Controlled inference was not released")
+                return value + 1
+            finally:
+                finished.set()
+
+        def close(self):
+            assert finished.is_set()
+            closed.set()
+
+    if kind == "async":
+        Model.infer = async_infer
+    monkeypatch.setattr(executor_module, "_load_native_model", lambda _: Model)
+    executor = NativeRewardExecutor(
+        RewardModelSpec(name="quality", backend="native", device_type="cpu", executor_config={"model": "test:model"})
+    )
+    await executor.wake_up()
+    operation = executor.infer(1)
+    caller = asyncio.create_task(asyncio.wait_for(operation, 0.02) if trigger == "timeout" else operation)
+    sleeping = None
+    try:
+        async with asyncio.timeout(1):
+            while not entered.is_set():
+                await asyncio.sleep(0.001)
+        if trigger == "cancel":
+            caller.cancel()
+        await asyncio.wait({caller}, timeout=0.04)
+        assert not caller.done()
+        assert executor._inflight == 1
+        assert not finished.is_set()
+        sleeping = asyncio.create_task(executor.sleep())
+        await asyncio.wait({sleeping}, timeout=0.02)
+        assert not sleeping.done()
+        assert not closed.is_set()
+        release.set()
+        await asyncio.wait_for(sleeping, 1)
+        with pytest.raises(asyncio.CancelledError if trigger == "cancel" else TimeoutError):
+            await asyncio.wait_for(asyncio.shield(caller), 1)
+        assert finished.is_set() and closed.is_set()
+        assert executor._inflight == 0 and executor._model is None
+    finally:
+        release.set()
+        await asyncio.gather(caller, *([sleeping] if sleeping else []), return_exceptions=True)
+        await executor.sleep()
 
 
 @pytest.mark.asyncio
@@ -73,14 +149,13 @@ async def test_cpu_native_executor_uses_unindexed_cpu_device(monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("device_type", ["cpu", "accelerator"])
-async def test_native_executor_explicit_device_does_not_probe_accelerator(monkeypatch, device_type):
+async def test_native_executor_explicit_cpu_device_does_not_probe_accelerator(monkeypatch):
     executor = NativeRewardExecutor(
         RewardModelSpec(
             name="quality",
             backend="native",
             executor_config={"model": "tests.fake:CpuModel", "kwargs": {"device": "cpu"}},
-            device_type=device_type,
+            device_type="cpu",
         )
     )
     monkeypatch.setattr(executor_module, "_load_native_model", lambda _: lambda device: SimpleNamespace(device=device))
@@ -99,6 +174,12 @@ async def test_native_executor_explicit_device_does_not_probe_accelerator(monkey
         ({"resource": "cpu", "cpus_per_worker": 1.5}, "positive integer"),
         ({"resource": "cpu", "cpus_per_worker": "2"}, "positive integer"),
         ({"resource": "accelerator", "cpus_per_worker": 2}, "only supported for resource='cpu'"),
+        ({"resource": "cpu", "num_replicas": 0}, "placement.num_replicas"),
+        ({"resource": "cpu", "num_replicas": True}, "placement.num_replicas"),
+        ({"resource": "cpu", "num_replicas": 1.5}, "placement.num_replicas"),
+        ({"resource": "cpu", "num_replicas": None}, "placement.num_replicas"),
+        ({"resource": "cpu", "devices": [0]}, "remove placement.devices"),
+        ({"resource": "accelerator", "num_replicas": 2}, "only supported for resource='cpu'"),
     ],
 )
 def test_cpu_native_rejects_invalid_resource_reservations(placement, message):
@@ -107,10 +188,52 @@ def test_cpu_native_rejects_invalid_resource_reservations(placement, message):
             "quality",
             {
                 "backend": "native",
-                "placement": {"devices": [0], **placement},
+                "placement": {
+                    **({"num_replicas": 1} if placement["resource"] == "cpu" else {"devices": [0]}),
+                    **placement,
+                },
                 "executor": {"model": "tests.fake:CpuModel"},
             },
         )
+
+
+@pytest.mark.parametrize(
+    "resource,device,valid",
+    [
+        ("cpu", "cpu", True),
+        ("cpu", torch.device("cpu"), True),
+        ("cpu", "cpu:0", True),
+        ("cpu", "cuda:0", False),
+        ("cpu", torch.device("cuda:1"), False),
+        ("accelerator", "cpu", False),
+        ("accelerator", "cuda:0", True),
+        ("accelerator", "meta", False),
+        ("cpu", "invalid-device", False),
+        ("cpu", None, False),
+        ("cpu", 0, False),
+    ],
+)
+def test_explicit_native_device_matches_reserved_resource(monkeypatch, resource, device, valid):
+    from verl_omni.workers.config import reward as config_module
+
+    monkeypatch.setattr(config_module, "get_device_name", lambda: "cuda")
+    value = {
+        "backend": "native",
+        "placement": {"resource": resource, **({"num_replicas": 2} if resource == "cpu" else {"devices": [0]})},
+        "executor": {"model": "tests.fake:CpuModel", "kwargs": {"device": device}},
+    }
+    if valid:
+        parsed = parse_reward_model_config("quality", value)
+        assert parsed.executor.kwargs["device"] == device
+    else:
+        with pytest.raises(ValueError, match=r"executor.kwargs.device"):
+            MultiRewardModelManager(
+                OmegaConf.create(
+                    {"reward": {"models": {"quality": value}, "reward_model": {"enable": False}}},
+                    flags={"allow_objects": True},
+                )
+            )
+    assert not torch.cuda.is_initialized()
 
 
 @pytest.mark.asyncio
@@ -137,11 +260,13 @@ async def test_cpu_phase_submission_failure_drains_accepted_rpc_before_sleep():
     async def wake_up():
         calls.append("wake_up")
 
-    async def sleep():
+    async def sleep(*, native_timeout=None):
         calls.append("sleep")
 
     manager = object.__new__(OmniRewardLoopManager)
     manager._score_lock = asyncio.Lock()
+    manager._scoring_unusable = False
+    manager._shared_worker_process_identities = {}
     manager._reward_dispatch_batch_sizes = {}
     manager._reward_worker_groups = {
         "quality": [
@@ -168,7 +293,7 @@ async def test_cpu_phase_submission_failure_drains_accepted_rpc_before_sleep():
 def test_shared_worker_identity_is_recorded_before_native_cpus_are_reserved(monkeypatch):
     model_config = {
         "backend": "native",
-        "placement": {"resource": "cpu", "devices": [0]},
+        "placement": {"resource": "cpu", "num_replicas": 1},
         "executor": {"model": "tests.fake:CpuModel"},
     }
     model = NativeManagedRewardModel("quality", model_config)
@@ -204,7 +329,6 @@ def test_shared_worker_identity_is_recorded_before_native_cpus_are_reserved(monk
     manager.multi_reward_model_manager = SimpleNamespace(
         models={"quality": model},
         reward_model_specs={"quality": model.spec},
-        native_device_assignments={"quality": (0,)},
         bind_native_workers=lambda name, workers: model.bind_workers(workers),
     )
     manager._create_node_affinity_workers = lambda *args: [shared]
@@ -251,7 +375,7 @@ async def test_never_returning_rpc_has_bounded_cleanup_and_retains_model_until_s
         "quality",
         {
             "backend": "native",
-            "placement": {"resource": "cpu", "devices": [0]},
+            "placement": {"resource": "cpu", "num_replicas": 1},
             "executor": {"model": "tests.fake:CpuModel"},
         },
     )
@@ -261,7 +385,7 @@ async def test_never_returning_rpc_has_bounded_cleanup_and_retains_model_until_s
     async def wake():
         pass
 
-    async def sleep():
+    async def sleep(*, native_timeout=None):
         assert calls == ["terminate", "stopped"]
         assert worker not in model._workers
         calls.append("sleep")
@@ -279,7 +403,10 @@ async def test_never_returning_rpc_has_bounded_cleanup_and_retains_model_until_s
     monkeypatch.setattr(loop_module, "terminate_actor_and_wait", terminate)
     manager = object.__new__(OmniRewardLoopManager)
     manager._score_lock = asyncio.Lock()
+    manager._scoring_unusable = False
+    manager._shared_worker_process_identities = {}
     manager._reward_worker_groups = {"quality": workers}
+    manager._reward_dispatch_batch_sizes = {}
     manager.multi_reward_model_manager = SimpleNamespace(
         models={"quality": model},
         wake_up=wake,
@@ -310,3 +437,126 @@ async def test_never_returning_rpc_has_bounded_cleanup_and_retains_model_until_s
         assert "termination could not be confirmed" in str(result)
     with pytest.raises(RuntimeError, match="recreate the reward manager"):
         await manager.async_compute_rm_score(DataProto.from_dict(tensors={"id": torch.arange(2)}))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["wake_up", "sleep"])
+async def test_engine_lifecycle_awaits_existing_replica_methods_concurrently(method):
+    entered = set()
+    all_entered = asyncio.Event()
+
+    def replica(index):
+        async def lifecycle():
+            entered.add(index)
+            if len(entered) == 2:
+                all_entered.set()
+            await all_entered.wait()
+
+        return SimpleNamespace(**{method: lifecycle})
+
+    model = object.__new__(EngineManagedRewardModel)
+    model.offload = True
+    model.reward_model_manager = SimpleNamespace(rollout_replicas=[replica(0), replica(1)])
+    await asyncio.wait_for(getattr(model, method)(), timeout=0.5)
+    assert entered == {0, 1}
+
+
+@pytest.mark.parametrize("failure", ["error", "timeout"])
+def test_sync_scoring_engine_sleep_failure_is_bounded_without_executor_threads(monkeypatch, failure):
+    import threading
+
+    calls = []
+    replica_sleep_finished = []
+
+    async def wake():
+        calls.append("wake")
+
+    async def sleep(*, native_timeout=None):
+        calls.append("sleep")
+        try:
+            if failure == "error":
+                raise ValueError("injected replica sleep failure")
+            await asyncio.Event().wait()
+        finally:
+            replica_sleep_finished.append(True)
+
+    def synchronous_sleep():
+        # The previous bridge outlived wait_for and delayed asyncio.run exit.
+        time.sleep(0.6)
+
+    engine = object.__new__(EngineManagedRewardModel)
+    engine.offload = True
+    engine.spec = RewardModelSpec(name="ocr", backend="engine")
+    engine.reward_model_manager = SimpleNamespace(
+        rollout_replicas=[SimpleNamespace(wake_up=wake, sleep=sleep)],
+        wake_up=lambda: None,
+        sleep=synchronous_sleep,
+    )
+    models = object.__new__(MultiRewardModelManager)
+    models.models = {"ocr": engine}
+    manager = object.__new__(OmniRewardLoopManager)
+    manager._score_lock = asyncio.Lock()
+    manager._scoring_unusable = False
+    manager.multi_reward_model_manager = models
+
+    async def score(data):
+        calls.append("score")
+        return data
+
+    manager._compute_named_model_scores = score
+    monkeypatch.setattr(loop_module, "_MODEL_SLEEP_TIMEOUT", 0.02)
+    threads_before = set(threading.enumerate())
+    started = time.monotonic()
+    with pytest.raises(RuntimeError, match="Reward model cleanup failed") as caught:
+        manager.compute_rm_score(object())
+    assert time.monotonic() - started < 0.3
+    assert isinstance(caught.value.__cause__, ValueError if failure == "error" else TimeoutError)
+    assert calls == ["wake", "score", "sleep"]
+    assert replica_sleep_finished == [True]
+    assert set(threading.enumerate()) <= threads_before
+    assert not manager._score_lock.locked()
+    assert manager._scoring_unusable
+    with pytest.raises(RuntimeError, match="recreate the reward manager"):
+        manager.compute_rm_score(object())
+
+
+@pytest.mark.parametrize("blocked", ["lock", "rpc"])
+def test_sync_native_sleep_deadline_remains_bounded_with_owned_cancellation(monkeypatch, blocked):
+    finished = []
+
+    async def stalled_sleep():
+        try:
+            await asyncio.Event().wait()
+        finally:
+            finished.append(True)
+
+    model = NativeManagedRewardModel(
+        "quality",
+        {
+            "backend": "native",
+            "placement": {"resource": "cpu", "num_replicas": 1},
+            "executor": {"model": "tests.fake:CpuModel"},
+        },
+    )
+    model.bind_workers([SimpleNamespace(sleep_reward_model=SimpleNamespace(remote=lambda name: stalled_sleep()))])
+    if blocked == "lock":
+        model._lifecycle_lock = asyncio.Lock()
+        asyncio.run(model._lifecycle_lock.acquire())
+    models = object.__new__(MultiRewardModelManager)
+    models.models = {"quality": model}
+    manager = object.__new__(OmniRewardLoopManager)
+    manager._score_lock = asyncio.Lock()
+    manager._scoring_unusable = False
+    manager.multi_reward_model_manager = models
+    manager._compute_named_model_scores = lambda data: asyncio.sleep(0, result=data)
+    models.wake_up = lambda: asyncio.sleep(0)
+    monkeypatch.setattr(loop_module, "_MODEL_SLEEP_TIMEOUT", 0.02)
+    started = time.monotonic()
+    with pytest.raises(RuntimeError, match="Reward model cleanup failed"):
+        manager.compute_rm_score(object())
+    assert time.monotonic() - started < 0.3
+    assert manager._scoring_unusable and not manager._score_lock.locked()
+    assert model._workers
+    assert finished == ([] if blocked == "lock" else [True])
+    if blocked == "lock":
+        model._lifecycle_lock.release()

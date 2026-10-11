@@ -16,6 +16,7 @@
 import inspect
 import logging
 from abc import ABC, abstractmethod
+from collections import ChainMap
 
 import torch
 from verl import DataProto
@@ -25,7 +26,7 @@ from verl.utils.import_utils import load_extern_object
 from verl_omni.workers.config.reward import get_reward_model_entries, resolve_reward_model_name
 
 from .media import _reward_extra_info
-from .visual import _validate_visual_response
+from .visual import _sampling_params_from_rollout, _validate_visual_response
 
 logger = logging.getLogger(__name__)
 
@@ -79,9 +80,16 @@ class MultiRewardManager(RewardManagerBase, ABC):
 
         self._sub_rewards = []
         total_weight = 0.0
-        _reserved_keys = {"path", "name", "weight", "required", "model"}
+        _reserved_keys = {"path", "name", "weight", "required", "model", "use_rollout_sampling_params"}
         for key, entry in reward_functions_cfg.items():
             model_name = resolve_reward_model_name(key, entry, reward_models_cfg)
+            use_rollout_sampling_params = entry.get("use_rollout_sampling_params", False)
+            if not isinstance(use_rollout_sampling_params, bool):
+                raise TypeError("use_rollout_sampling_params must be a boolean")
+            if use_rollout_sampling_params and (
+                model_name is None or reward_models_cfg[model_name].get("backend") != "engine"
+            ):
+                raise ValueError("use_rollout_sampling_params requires a named engine reward model")
             path = entry.get("path")
             name = entry.get("name")
             if (path is None) != (name is None):
@@ -120,6 +128,7 @@ class MultiRewardManager(RewardManagerBase, ABC):
                     "is_async": is_async,
                     "extra_args": extra_args,
                     "model": model_name,
+                    "use_rollout_sampling_params": use_rollout_sampling_params,
                 }
             )
             logger.info(
@@ -167,7 +176,14 @@ class MultiRewardManager(RewardManagerBase, ABC):
 
             if model_name is not None:
                 executor = self._engine_reward_executors.get(model_name)
-                if executor is None:
+                if executor is not None:
+                    if sub["use_rollout_sampling_params"] and "sampling_params" not in extra_args:
+                        model = get_reward_model_entries(self.config)[model_name]
+                        rollout = ChainMap(
+                            model.get("rollout") or {}, self.config.reward.reward_model.get("rollout") or {}
+                        )
+                        sub_kwargs["sampling_params"] = _sampling_params_from_rollout(rollout)
+                else:
                     executor = self._native_reward_executors.get(model_name)
                 if executor is None:
                     raise RuntimeError(f"Reward model {model_name!r} is not available in this worker")
@@ -243,9 +259,7 @@ class MultiVisualRewardManager(MultiRewardManager):
         }
         if self.reward_router_address is not None:
             rm_rollout = self.config.reward.reward_model.rollout
-            sampling_params = {"max_tokens": getattr(rm_rollout, "response_length", None) or 4096}
-            if rm_rollout.get("full_determinism", False):
-                sampling_params["seed"] = rm_rollout.get("seed", 42)
+            sampling_params = _sampling_params_from_rollout(rm_rollout)
             reward_kwargs.update(
                 reward_router_address=self.reward_router_address,
                 reward_model_tokenizer=self.reward_model_tokenizer,

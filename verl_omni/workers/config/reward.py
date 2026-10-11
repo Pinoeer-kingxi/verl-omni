@@ -19,8 +19,10 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
+import torch
 from omegaconf import OmegaConf
 from verl.base_config import BaseConfig
+from verl.utils.device import get_device_name
 
 __all__ = [
     "EngineRewardModelConfig",
@@ -56,26 +58,33 @@ class RewardModelPlacementConfig(BaseConfig):
 
     ``accelerator`` keeps the existing contract: ``devices`` are global logical
     bundle indices in the trainer-selected parent resource pool.  ``cpu`` uses
-    ordinary Ray CPU actor resources and treats ``devices`` as stable logical
-    replica slots; no GPU parent pool is required.
+    ordinary Ray CPU actors counted by ``num_replicas``; no GPU parent pool is required.
     """
 
-    # Accelerator bundle indices, or logical CPU replica slots.
+    # Global accelerator bundle indices in the trainer-selected parent pool.
     devices: list[int] = field(default_factory=list)
     # Ray resource kind used to place complete native replicas.
     resource: str = "accelerator"
     # CPU capacity reserved for each CPU replica actor.
     cpus_per_worker: int = 1
+    # Number of complete CPU replicas; accelerator replicas use devices.
+    num_replicas: int | None = None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.devices, list) or not self.devices:
+        if self.resource not in ("accelerator", "cpu"):
+            raise ValueError("Native reward model placement.resource must be 'accelerator' or 'cpu'")
+        if self.is_cpu:
+            if self.devices:
+                raise ValueError("CPU placement uses placement.num_replicas; remove placement.devices")
+            _validate_positive_int(self.num_replicas, "Native reward model placement.num_replicas")
+        elif self.num_replicas is not None:
+            raise ValueError("placement.num_replicas is only supported for resource='cpu'")
+        if not isinstance(self.devices, list) or (not self.is_cpu and not self.devices):
             raise ValueError("Native reward model placement.devices must be a non-empty list")
         if any(isinstance(device, bool) or not isinstance(device, int) or device < 0 for device in self.devices):
             raise ValueError("Native reward model placement.devices must contain non-negative integers")
         if len(set(self.devices)) != len(self.devices):
             raise ValueError("Native reward model placement.devices must not contain duplicates")
-        if self.resource not in {"accelerator", "cpu"}:
-            raise ValueError("Native reward model placement.resource must be 'accelerator' or 'cpu'")
         if (
             isinstance(self.cpus_per_worker, bool)
             or not isinstance(self.cpus_per_worker, int)
@@ -93,15 +102,16 @@ class RewardModelPlacementConfig(BaseConfig):
     @classmethod
     def from_mapping(cls, name: str, value) -> RewardModelPlacementConfig:
         placement = to_mapping(value)
-        allowed = {"devices", "resource", "cpus_per_worker"}
+        allowed = {"devices", "resource", "cpus_per_worker", "num_replicas"}
         _reject_unknown_fields(name, placement, allowed, prefix="placement.")
-        if "devices" not in placement:
+        if placement.get("resource", "accelerator") == "accelerator" and "devices" not in placement:
             raise ValueError(f"Native reward model {name!r} requires placement.devices")
         try:
             return cls(
-                devices=placement["devices"],
+                devices=placement.get("devices", []),
                 resource=placement.get("resource", "accelerator"),
                 cpus_per_worker=placement.get("cpus_per_worker", 1),
+                num_replicas=placement.get("num_replicas"),
             )
         except (TypeError, ValueError) as exc:
             raise type(exc)(f"Native reward model {name!r} {exc}") from exc
@@ -247,6 +257,8 @@ class NativeRewardModelConfig(RewardModelConfig):
 
     placement: RewardModelPlacementConfig | None = None
     executor: NativeRewardModelExecutorConfig | None = None
+    # Null preserves static splitting; a positive size enables completion-driven dispatch.
+    dispatch_batch_size: int | None = None
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -256,11 +268,30 @@ class NativeRewardModelConfig(RewardModelConfig):
             raise ValueError(f"Native reward model {self.name!r} requires placement.devices")
         if not isinstance(self.executor, NativeRewardModelExecutorConfig):
             raise ValueError(f"Native reward model {self.name!r} requires executor.model")
+        if self.dispatch_batch_size is not None:
+            _validate_positive_int(self.dispatch_batch_size, f"Native reward model {self.name!r} dispatch_batch_size")
+
+        if "device" in self.executor.kwargs:
+            configured_device = self.executor.kwargs["device"]
+            if not isinstance(configured_device, str | torch.device):
+                raise ValueError(
+                    f"Native reward model {self.name!r} executor.kwargs.device must be a device string or torch.device"
+                )
+            try:
+                device = torch.device(configured_device)
+            except (TypeError, RuntimeError, ValueError) as exc:
+                raise ValueError(f"Native reward model {self.name!r} executor.kwargs.device is invalid") from exc
+            expected_device_type = "cpu" if self.placement.is_cpu else get_device_name()
+            if device.type != expected_device_type or (device.type == "cpu" and not self.placement.is_cpu):
+                raise ValueError(
+                    f"Native reward model {self.name!r} executor.kwargs.device={str(device)!r} "
+                    f"conflicts with placement.resource={self.placement.resource!r}"
+                )
 
     @classmethod
     def from_mapping(cls, name: str, value) -> NativeRewardModelConfig:
         model = to_mapping(value)
-        allowed = {"backend", "offload", "model_path", "placement", "executor"}
+        allowed = {"backend", "offload", "model_path", "placement", "executor", "dispatch_batch_size"}
         _reject_unknown_fields(name, model, allowed)
         return cls(
             name=name,
@@ -269,6 +300,7 @@ class NativeRewardModelConfig(RewardModelConfig):
             model_path=model.get("model_path"),
             placement=RewardModelPlacementConfig.from_mapping(name, model.get("placement")),
             executor=NativeRewardModelExecutorConfig.from_mapping(name, model.get("executor")),
+            dispatch_batch_size=model.get("dispatch_batch_size"),
         )
 
 
@@ -365,7 +397,7 @@ def reward_role_required(config) -> bool:
             continue
         placement = model.get("placement") or {}
         resource = placement.get("resource", "accelerator")
-        if resource not in {"accelerator", "cpu"}:
+        if resource not in ("accelerator", "cpu"):
             raise ValueError(f"Unsupported native reward placement resource {resource!r}")
         if resource == "accelerator":
             return True

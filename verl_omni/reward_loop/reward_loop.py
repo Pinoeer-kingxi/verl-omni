@@ -21,7 +21,7 @@ from omegaconf import open_dict
 from tensordict import TensorDict
 from verl.experimental.reward_loop import RewardLoopManager
 from verl.experimental.reward_loop.reward_loop import RewardLoopWorker
-from verl.protocol import DataProto, pad_dataproto_to_divisor
+from verl.protocol import DataProto
 from verl.trainer.ppo.reward import resolve_reward_manager_cls
 
 from verl_omni.utils.ray_lifecycle import actor_process_identity, terminate_actor_and_wait
@@ -29,15 +29,18 @@ from verl_omni.workers.config.reward import (
     accelerator_workers_enabled,
     get_reward_model_entries,
     has_reward_models,
+    parse_reward_model_config,
     resolve_reward_model_name,
     streaming_reward_enabled,
     validate_reward_model_terms,
 )
 
+from .replica_dispatch import dispatch_reward_groups
 from .reward_model import MultiRewardModelManager, NativeManagedRewardModel
 from .reward_model_executor import (
     EngineRewardExecutor,
     NativeRewardExecutor,
+    _await_owned,
     build_engine_reward_executors,
     build_native_reward_executors,
 )
@@ -112,6 +115,22 @@ class OmniRewardLoopWorker(RewardLoopWorker):
             raise ValueError(f"Worker has no native reward model {model_name!r}") from exc
         await executor.sleep()
 
+    async def close_reward_model(self, name: str | None = None) -> None:
+        await _await_owned(self._close_reward_model(name))
+
+    async def _close_reward_model(self, name: str | None = None) -> None:
+        if name is None:
+            executors = self.native_reward_executors.values()
+        else:
+            try:
+                executors = (self.native_reward_executors[name],)
+            except KeyError as exc:
+                raise ValueError(f"Worker has no native reward model {name!r}") from exc
+        results = await asyncio.gather(*(executor.close() for executor in executors), return_exceptions=True)
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+
 
 class OmniRewardLoopManager(RewardLoopManager):
     """RewardLoopManager that can start/stop the profiler on the reward-model rollout servers.
@@ -126,6 +145,7 @@ class OmniRewardLoopManager(RewardLoopManager):
 
     def __init__(self, config, rm_resource_pool=None, accelerator_resource_pool=None):
         self._score_lock = asyncio.Lock()
+        self._scoring_unusable = False
         self.accelerator_resource_pool = accelerator_resource_pool
         named_reward_manager_cls = None
         if has_reward_models(config):
@@ -165,6 +185,7 @@ class OmniRewardLoopManager(RewardLoopManager):
         self._reward_worker_groups = {}
         self._shared_worker_process_identities = {}
         self._reward_worker_group_configs = {}
+        self._reward_dispatch_batch_sizes = {}
 
         if self.multi_reward_model_manager.models:
             entries = self.config.reward.reward_functions
@@ -194,10 +215,15 @@ class OmniRewardLoopManager(RewardLoopManager):
                 }
 
             for model_name, terms in terms_by_group.items():
-                placement = self.multi_reward_model_manager.native_device_assignments[model_name]
+                model_config = parse_reward_model_config(model_name, models[model_name])
+                if model_config.dispatch_batch_size is not None:
+                    self._reward_dispatch_batch_sizes[model_name] = model_config.dispatch_batch_size
+                placement = self.multi_reward_model_manager.models[model_name].placement
                 group_config = self._copy_reward_config(terms)
                 with open_dict(group_config.reward):
-                    group_config.reward.num_workers = len(placement)
+                    group_config.reward.num_workers = (
+                        placement.num_replicas if placement.is_cpu else len(placement.devices)
+                    )
                 workers = self._create_native_workers(
                     group_config,
                     {model_name: specs[model_name]},
@@ -270,17 +296,14 @@ class OmniRewardLoopManager(RewardLoopManager):
     def _create_native_workers(self, config, specs, model_name, name_prefix):
         model = self.multi_reward_model_manager.models[model_name]
         if model.placement.is_cpu:
-            from .cpu_reward_workers import build_cpu_reward_workers
-
             placement = model.placement
-            return build_cpu_reward_workers(
-                config=config,
-                reward_loop_workers_class=self.reward_loop_workers_class,
-                reward_model_specs=specs,
-                worker_indices=placement.devices,
-                cpus_per_worker=placement.cpus_per_worker,
-                worker_name_prefix=name_prefix,
-            )
+            return [
+                self.reward_loop_workers_class.options(
+                    num_cpus=placement.cpus_per_worker,
+                    name=f"{name_prefix}_{index}",
+                ).remote(config, None, specs)
+                for index in range(placement.num_replicas)
+            ]
 
         from .accelerator_reward_workers import build_accelerator_reward_workers
 
@@ -306,17 +329,34 @@ class OmniRewardLoopManager(RewardLoopManager):
             return asyncio.run(self.async_compute_rm_score(data))
         raise RuntimeError("compute_rm_score() cannot run inside an event loop; await async_compute_rm_score() instead")
 
+    async def _drain_lifecycle(self, operation):
+        """Keep accepted lifecycle work owned until completion, even on cancellation."""
+        pending = asyncio.ensure_future(operation)
+        cancellation = None
+        while not pending.done():
+            try:
+                await asyncio.shield(pending)
+            except asyncio.CancelledError as exc:
+                cancellation = exc
+            except Exception:
+                if cancellation is None:
+                    raise
+                logger.exception("Reward lifecycle failed while draining cancellation")
+        if cancellation is not None:
+            raise cancellation
+        return pending.result()
+
     async def async_compute_rm_score(self, data):
         """Score named reward models without blocking the caller's event loop."""
         if not self.multi_reward_model_manager.models:
             return await asyncio.to_thread(super().compute_rm_score, data)
         async with self._score_lock:
-            if getattr(self, "_scoring_unusable", False):
+            if self._scoring_unusable:
                 raise RuntimeError("Reward worker cleanup failed or required termination; recreate the reward manager")
             self._safe_to_sleep = True
             scoring_error = None
             try:
-                await self.multi_reward_model_manager.wake_up()
+                await self._drain_lifecycle(self.multi_reward_model_manager.wake_up())
                 return await self._compute_named_model_scores(data)
             except BaseException as exc:
                 scoring_error = exc
@@ -343,7 +383,9 @@ class OmniRewardLoopManager(RewardLoopManager):
 
     async def _sleep_models_bounded(self):
         try:
-            await asyncio.wait_for(self.multi_reward_model_manager.sleep(), timeout=_MODEL_SLEEP_TIMEOUT)
+            await asyncio.wait_for(
+                self.multi_reward_model_manager.sleep(native_timeout=_MODEL_SLEEP_TIMEOUT), timeout=_MODEL_SLEEP_TIMEOUT
+            )
         except BaseException as exc:
             self._scoring_unusable = True
             raise RuntimeError("Reward model cleanup failed; recreate the reward manager") from exc
@@ -353,7 +395,7 @@ class OmniRewardLoopManager(RewardLoopManager):
         if not pending:
             return
         self._scoring_unusable = True
-        identities = dict(getattr(self, "_shared_worker_process_identities", {}))
+        identities = dict(self._shared_worker_process_identities)
         native_models = [
             model
             for model in self.multi_reward_model_manager.models.values()
@@ -393,41 +435,12 @@ class OmniRewardLoopManager(RewardLoopManager):
             model._workers = [worker for worker in model._workers if id(worker) not in stopped_ids]
 
     async def _compute_named_model_scores(self, data: DataProto) -> DataProto:
-        requests_by_group = {}
-        accepted = []
-        dispatch_error = None
-        try:
-            for group_name, workers in self._reward_worker_groups.items():
-                num_workers = len(workers)
-                padded_data, pad_size = pad_dataproto_to_divisor(data, num_workers)
-                chunks = padded_data.chunk(num_workers)
-                requests = []
-                requests_by_group[group_name] = (requests, pad_size)
-                for worker, chunk in zip(workers, chunks, strict=True):
-                    task = asyncio.ensure_future(worker.compute_score_batch.remote(chunk))
-                    requests.append(task)
-                    accepted.append((worker, task))
-        except Exception as exc:
-            dispatch_error = exc
+        async def drain_requests(requests):
+            await self._await_cleanup(asyncio.create_task(self._drain_or_stop_scoring(requests)))
 
-        all_requests = [request for requests, _ in requests_by_group.values() for request in requests]
-        pending = asyncio.gather(*all_requests)
-        pending.add_done_callback(lambda result: None if result.cancelled() else result.exception())
-        try:
-            if dispatch_error is not None:
-                raise dispatch_error
-            all_outputs = await asyncio.shield(pending)
-        except BaseException:
-            if accepted:
-                await self._await_cleanup(asyncio.create_task(self._drain_or_stop_scoring(accepted)))
-            raise
-        group_outputs = {}
-        offset = 0
-        for group_name, (requests, pad_size) in requests_by_group.items():
-            outputs = all_outputs[offset : offset + len(requests)]
-            offset += len(requests)
-            flattened = [item for sublist in outputs for item in sublist]
-            group_outputs[group_name] = flattened[: len(data)] if pad_size else flattened
+        group_outputs = await dispatch_reward_groups(
+            data, self._reward_worker_groups, self._reward_dispatch_batch_sizes, drain_requests=drain_requests
+        )
 
         merged_scores = []
         merged_infos = []

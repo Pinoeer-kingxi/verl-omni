@@ -16,6 +16,7 @@
 import asyncio
 import os
 import time
+from threading import Event
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -61,6 +62,86 @@ class _TorchCpuModel:
             "device": str(self.weight.device),
             "instance_id": self.instance_id,
         }
+
+
+class _BlockingCpuModel(_CpuModel):
+    def __init__(self, device):
+        super().__init__("controlled", device)
+        self.entered, self.release, self.finished = (Event() for _ in range(3))
+
+    def infer(self, value):
+        self.entered.set()
+        try:
+            if not self.release.wait(30):
+                raise TimeoutError("Controlled inference was not released")
+            return super().infer(value)
+        finally:
+            self.finished.set()
+
+    def close(self):
+        assert self.finished.is_set()
+        super().close()
+
+
+@ray.remote
+class _CancellableCpuWorker:
+    def __init__(self):
+        self.executor = NativeRewardExecutor(
+            RewardModelSpec(
+                name="quality",
+                backend="native",
+                device_type="cpu",
+                executor_config={"model": f"{_BlockingCpuModel.__module__}:_BlockingCpuModel"},
+            )
+        )
+        self.model = None
+
+    async def infer(self):
+        await self.executor.wake_up()
+        self.model = self.executor._model
+        return await self.executor.infer(41)
+
+    async def wait_until_entered(self):
+        async with asyncio.timeout(10):
+            while self.model is None or not self.model.entered.is_set():
+                await asyncio.sleep(0.001)
+
+    def state(self):
+        return self.executor._inflight, self.model.finished.is_set(), self.model.closed
+
+    def release(self):
+        if self.model is not None:
+            self.model.release.set()
+
+    async def sleep(self):
+        await self.executor.sleep()
+        return self.executor._inflight, self.model.finished.is_set(), self.model.closed
+
+
+def test_real_ray_cancellation_retains_cpu_model_until_inference_thread_exits():
+    ray.init(num_cpus=2, num_gpus=0, include_dashboard=False, object_store_memory=128 * 1024**2)
+    worker = None
+    try:
+        worker = _CancellableCpuWorker.options(num_cpus=1, num_gpus=0).remote()
+        ray.get(worker.__ray_ready__.remote(), timeout=60)
+        inference = worker.infer.remote()
+        ray.get(worker.wait_until_entered.remote(), timeout=30)
+        ray.cancel(inference)
+        assert not ray.wait([inference], timeout=0.1)[0]
+        assert ray.get(worker.state.remote(), timeout=5) == (1, False, False)
+        sleeping = worker.sleep.remote()
+        assert not ray.wait([sleeping], timeout=0.1)[0]
+        assert ray.get(worker.state.remote(), timeout=5) == (1, False, False)
+        ray.get(worker.release.remote(), timeout=5)
+        assert ray.get(sleeping, timeout=5) == (0, True, True)
+        with pytest.raises(ray.exceptions.TaskCancelledError):
+            ray.get(inference, timeout=5)
+    finally:
+        try:
+            if worker is not None:
+                ray.get(worker.release.remote(), timeout=5)
+        finally:
+            ray.shutdown()
 
 
 async def reward_torch_cpu(reward_model, solution_image, ground_truth):
@@ -130,6 +211,26 @@ class _RestartableRewardWorker(OmniRewardLoopWorker):
         return self._delayed_succeeded, executor._model is None, executor._inflight
 
 
+_CREATE_NATIVE_WORKERS = OmniRewardLoopManager._create_native_workers
+
+
+def _native_workers_for_test(manager, config, specs, model_name, name_prefix, max_restarts):
+    original_class = manager.reward_loop_workers_class
+    manager.reward_loop_workers_class = ray.remote(max_restarts=max_restarts)(_RestartableRewardWorker)
+    try:
+        return _CREATE_NATIVE_WORKERS(manager, config, specs, model_name, name_prefix)
+    finally:
+        manager.reward_loop_workers_class = original_class
+
+
+def _controlled_native_workers(manager, config, specs, model_name, name_prefix):
+    return _native_workers_for_test(manager, config, specs, model_name, name_prefix, max_restarts=0)
+
+
+def _restartable_native_workers(manager, config, specs, model_name, name_prefix):
+    return _native_workers_for_test(manager, config, specs, model_name, name_prefix, max_restarts=1)
+
+
 async def wait_for_restarted_worker(worker, previous_pid, timeout=120):
     deadline = time.monotonic() + timeout
     while (remaining := deadline - time.monotonic()) > 0:
@@ -160,7 +261,7 @@ def _full_config(tmp_path, offload):
         "quality": {
             "backend": "native",
             "offload": offload,
-            "placement": {"resource": "cpu", "devices": [3, 7], "cpus_per_worker": 1},
+            "placement": {"resource": "cpu", "num_replicas": 2, "cpus_per_worker": 1},
             "executor": {"model": f"{__name__}:_TorchCpuModel"},
         }
     }
@@ -228,7 +329,7 @@ def test_cpu_native_workers_run_with_real_ray_cpu_resources():
             "quality",
             {
                 "backend": "native",
-                "placement": {"resource": "cpu", "devices": [3, 7], "cpus_per_worker": 2},
+                "placement": {"resource": "cpu", "num_replicas": 2, "cpus_per_worker": 2},
                 "executor": {"model": f"{_CpuModel.__module__}:_CpuModel"},
             },
         ).placement
@@ -254,15 +355,7 @@ def test_cpu_native_workers_run_with_real_ray_cpu_resources():
 
 @pytest.mark.parametrize("offload", [True, False])
 def test_full_cpu_reward_manager_scoring_and_real_actor_restart(tmp_path, monkeypatch, offload):
-    from verl_omni.reward_loop import cpu_reward_workers
-
-    original_builder = cpu_reward_workers.build_cpu_reward_workers
-
-    def restartable_workers(**kwargs):
-        kwargs["reward_loop_workers_class"] = ray.remote(max_restarts=1)(_RestartableRewardWorker)
-        return original_builder(**kwargs)
-
-    monkeypatch.setattr(cpu_reward_workers, "build_cpu_reward_workers", restartable_workers)
+    monkeypatch.setattr(OmniRewardLoopManager, "_create_native_workers", _restartable_native_workers)
     ray.init(num_cpus=4, num_gpus=0, include_dashboard=False, object_store_memory=128 * 1024**2)
     try:
         manager = OmniRewardLoopManager(_full_config(tmp_path, offload))
@@ -298,15 +391,7 @@ def test_full_cpu_reward_manager_scoring_and_real_actor_restart(tmp_path, monkey
 
 @pytest.mark.parametrize("separate_replica", [False, True])
 def test_cpu_phase_failure_drains_accepted_samples_before_sleep(tmp_path, monkeypatch, separate_replica):
-    from verl_omni.reward_loop import cpu_reward_workers
-
-    original_builder = cpu_reward_workers.build_cpu_reward_workers
-
-    def controlled_workers(**kwargs):
-        kwargs["reward_loop_workers_class"] = ray.remote(_RestartableRewardWorker)
-        return original_builder(**kwargs)
-
-    monkeypatch.setattr(cpu_reward_workers, "build_cpu_reward_workers", controlled_workers)
+    monkeypatch.setattr(OmniRewardLoopManager, "_create_native_workers", _controlled_native_workers)
     ray.init(num_cpus=4, num_gpus=0, include_dashboard=False, object_store_memory=128 * 1024**2)
     try:
         manager = OmniRewardLoopManager(_full_config(tmp_path, True))
@@ -340,15 +425,7 @@ def test_cpu_phase_failure_drains_accepted_samples_before_sleep(tmp_path, monkey
 
 
 def test_cpu_phase_cancellation_drains_accepted_samples_before_sleep(tmp_path, monkeypatch):
-    from verl_omni.reward_loop import cpu_reward_workers
-
-    original_builder = cpu_reward_workers.build_cpu_reward_workers
-
-    def controlled_workers(**kwargs):
-        kwargs["reward_loop_workers_class"] = ray.remote(_RestartableRewardWorker)
-        return original_builder(**kwargs)
-
-    monkeypatch.setattr(cpu_reward_workers, "build_cpu_reward_workers", controlled_workers)
+    monkeypatch.setattr(OmniRewardLoopManager, "_create_native_workers", _controlled_native_workers)
     ray.init(num_cpus=4, num_gpus=0, include_dashboard=False, object_store_memory=128 * 1024**2)
     try:
         manager = OmniRewardLoopManager(_full_config(tmp_path, True))
@@ -382,16 +459,9 @@ def test_cpu_phase_cancellation_drains_accepted_samples_before_sleep(tmp_path, m
 
 @pytest.mark.parametrize("stall_shared_worker", [False, True])
 def test_cpu_scoring_that_never_returns_exits_after_repeated_cancellation(tmp_path, monkeypatch, stall_shared_worker):
-    from verl_omni.reward_loop import cpu_reward_workers, reward_loop
+    from verl_omni.reward_loop import reward_loop
 
-    original_builder = cpu_reward_workers.build_cpu_reward_workers
-
-    def controlled_workers(**kwargs):
-        # Production has no restart policy; fault cleanup always disables restart.
-        kwargs["reward_loop_workers_class"] = ray.remote(_RestartableRewardWorker)
-        return original_builder(**kwargs)
-
-    monkeypatch.setattr(cpu_reward_workers, "build_cpu_reward_workers", controlled_workers)
+    monkeypatch.setattr(OmniRewardLoopManager, "_create_native_workers", _controlled_native_workers)
     if stall_shared_worker:
         original_shared = OmniRewardLoopManager._create_node_affinity_workers
 
