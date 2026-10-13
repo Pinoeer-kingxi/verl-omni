@@ -156,20 +156,29 @@ class OmniRewardLoopManager(RewardLoopManager):
             # Each named model receives a sub-pool from this one parent.
             resource_pool=rm_resource_pool,
         )
-        use_accelerator_workers = accelerator_workers_enabled(config)
-        if self.multi_reward_model_manager.models or use_accelerator_workers:
-            if use_accelerator_workers and config.reward.reward_model.get("enable", False):
-                raise ValueError("Accelerator reward workers cannot be combined with reward.reward_model.enable=True")
-            if self.multi_reward_model_manager.models and not config.reward.get("reward_functions"):
-                raise ValueError("reward.models requires non-empty reward.reward_functions")
-            self.config = config
-            self.reward_model_manager = None
-            self.reward_router_address = None
-            self.reward_loop_workers_class = ray.remote(OmniRewardLoopWorker)
-            self.reward_manager_cls = named_reward_manager_cls or resolve_reward_manager_cls(config)
-            self._init_reward_loop_workers()
-        else:
-            super().__init__(config=config, rm_resource_pool=rm_resource_pool)
+        try:
+            use_accelerator_workers = accelerator_workers_enabled(config)
+            if self.multi_reward_model_manager.models or use_accelerator_workers:
+                if use_accelerator_workers and config.reward.reward_model.get("enable", False):
+                    raise ValueError(
+                        "Accelerator reward workers cannot be combined with reward.reward_model.enable=True"
+                    )
+                if self.multi_reward_model_manager.models and not config.reward.get("reward_functions"):
+                    raise ValueError("reward.models requires non-empty reward.reward_functions")
+                self.config = config
+                self.reward_model_manager = None
+                self.reward_router_address = None
+                self.reward_loop_workers_class = ray.remote(OmniRewardLoopWorker)
+                self.reward_manager_cls = named_reward_manager_cls or resolve_reward_manager_cls(config)
+                self._init_reward_loop_workers()
+            else:
+                super().__init__(config=config, rm_resource_pool=rm_resource_pool)
+        except BaseException as error:
+            try:
+                self.multi_reward_model_manager.shutdown()
+            except Exception as cleanup_error:
+                error.add_note(f"Reward loop initialization cleanup also failed: {cleanup_error}")
+            raise
 
     @property
     def reward_loop_worker_handles(self):

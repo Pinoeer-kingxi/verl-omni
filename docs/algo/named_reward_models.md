@@ -94,6 +94,30 @@ Existing jobs without `reward.models` continue to use the existing single-model
 reward path. Do not set `reward.reward_model.enable=true` together with
 `reward.models`.
 
+## Final shutdown
+
+The V1 synchronous diffusion runner closes named vLLM reward services after
+training, including initialization and training failures. It retains the router
+process, stops the router, requests Uvicorn shutdown, and waits for listeners and
+application lifespan to close before shutting down the engine. A deadline or
+engine failure triggers termination of the owned actor and subprocesses. Cleanup
+then stops the replica's owned placement workers, after all of its inference
+consumers have been confirmed stopped. The shared parent resource pool stays
+under its caller's ownership. Cleanup reports failure when owned process exit
+cannot be confirmed; it preserves an earlier
+training error and attaches the cleanup failure to it.
+
+This covers local `mp` and `uni` executors with `mp` data parallelism. For
+vLLM-Omni sync rollouts, the runner also closes the HTTP servers and confirms
+rollout process exit before collecting training-side IPC and closing training
+workers. Explicit rollout shutdown supports the default local stage layout;
+custom stage configurations or remote executors report cleanup failure and
+retain producer IPC when consumer exit cannot be confirmed. Legacy single-model
+rewards, other rollout backends and asynchronous trainers keep their existing
+lifecycle. Direct users of `MultiRewardModelManager` can call `shutdown()` after
+all scoring work has ended. Offload `sleep()` remains a separate operation for
+reuse between scoring phases.
+
 ## Migrate an existing engine reward
 
 An existing single-model engine configuration has one global reward model and

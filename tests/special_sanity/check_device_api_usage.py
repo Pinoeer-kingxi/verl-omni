@@ -32,6 +32,7 @@ CUDA_KEYWORD_CHECK_WHITELIST = [
     "verl_omni/pipelines/qwen_image_flow_grpo/diffusers_training_adapter.py",  # docstring only
     "verl_omni/utils/mfu/diffusion_flops_counter.py",  # comment only
     "verl_omni/utils/diffusion_attention.py",  # CUDA-only by design: FA3 capability probe
+    "verl_omni/trainer/diffusion/v1/shutdown.py",  # NVIDIA runtime context teardown has no generic device API
     "verl_omni/utils/reward_score/hpsv3_reward.py",  # TODO: port to verl.utils.device
     "verl_omni/utils/reward_score/pickscore_reward.py",  # TODO: port to verl.utils.device
 ]

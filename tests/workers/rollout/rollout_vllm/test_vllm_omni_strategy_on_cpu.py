@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
+import weakref
 from argparse import Namespace
 from pathlib import Path
 from types import SimpleNamespace
@@ -973,6 +975,117 @@ async def test_strategy_preserves_mode_specific_engine_call(strategy_cls, priori
     assert engine.kwargs["request_id"] == "request-1"
     assert engine.kwargs["sampling_params_list"] == ["params"]
     assert set(engine.kwargs) - {"prompt", "request_id", "sampling_params_list"} == expected_extra_keys
+
+
+@pytest.mark.parametrize("failure", [None, "error", "timeout", "partial"])
+def test_omni_shutdown_confirms_exit_before_returning(monkeypatch, failure):
+    from verl_omni.reward_loop import engine_shutdown
+    from verl_omni.utils import ray_lifecycle
+
+    events = []
+
+    def close_engine():
+        events.append("engine")
+        if failure == "error":
+            raise ValueError("shutdown failed")
+        if failure == "timeout":
+            raise server_module.ray.exceptions.GetTimeoutError("shutdown timed out")
+
+    worker = SimpleNamespace(
+        engine=None if failure == "partial" else SimpleNamespace(shutdown=close_engine, final_output_task=None)
+    )
+    actor = SimpleNamespace(
+        __ray_call__=SimpleNamespace(remote=lambda fn: fn(worker)),
+        close_engine=SimpleNamespace(remote=lambda: asyncio.run(server_module.vLLMOmniHttpServer.close_engine(worker))),
+    )
+    identity = {"owned": True}
+    monkeypatch.setattr(server_module.ray, "get", lambda ref, timeout: ref)
+    monkeypatch.setattr(ray_lifecycle, "actor_process_identity", lambda _: identity)
+    monkeypatch.setattr(engine_shutdown, "close_http_server", lambda *args, **kwargs: events.append("http"))
+    monkeypatch.setattr(ray_lifecycle, "close_actor_gracefully", lambda *args, **kwargs: events.append("graceful exit"))
+    monkeypatch.setattr(
+        ray_lifecycle, "terminate_actor_and_wait", lambda *args, **kwargs: events.append("confirmed stop")
+    )
+    server_module._shutdown_omni_server(actor)
+    expected = ["http"] + ([] if failure == "partial" else ["engine"])
+    assert events == expected + ["confirmed stop" if failure in {"error", "timeout"} else "graceful exit"]
+
+
+@pytest.mark.asyncio
+async def test_engine_close_waits_for_output_task_finally():
+    events = []
+
+    async def output():
+        try:
+            await asyncio.sleep(60)
+        finally:
+            events.append("output stopped")
+
+    task = asyncio.create_task(output())
+    await asyncio.sleep(0)
+    worker = SimpleNamespace(engine=SimpleNamespace(final_output_task=task, shutdown=task.cancel))
+    await server_module.vLLMOmniHttpServer.close_engine(worker)
+    assert events == ["output stopped"] and task.cancelled()
+    assert worker.engine is None and worker._http_server is None and worker._server_task is None
+
+
+@pytest.mark.asyncio
+async def test_engine_close_collects_cancelled_output_task_engine_reference():
+    events = []
+
+    class Engine:
+        async def output(self):
+            try:
+                await asyncio.sleep(60)
+            finally:
+                events.append("output stopped")
+
+        def shutdown(self):
+            self.final_output_task.cancel()
+            self.final_output_task = None
+
+    engine = Engine()
+    engine.final_output_task = asyncio.create_task(engine.output())
+    weakref.finalize(engine, events.append, "engine freed")
+    worker = SimpleNamespace(engine=engine)
+    del engine
+    await asyncio.sleep(0)
+    await server_module.vLLMOmniHttpServer.close_engine(worker)
+    assert events == ["output stopped", "engine freed"]
+
+
+def test_omni_shutdown_failure_keeps_unconfirmed_server_and_closes_others(monkeypatch):
+    replica = object.__new__(server_module.vLLMOmniReplica)
+    replica.config = SimpleNamespace(engine_kwargs={"vllm_omni": {"distributed_executor_backend": "uni"}})
+    failing, healthy = object(), object()
+    replica.servers = [failing, healthy]
+    closed = []
+
+    def close(server):
+        closed.append(server)
+        if server is failing:
+            raise TimeoutError("process exit unconfirmed")
+
+    monkeypatch.setattr(server_module, "_shutdown_omni_server", close)
+    with pytest.raises(RuntimeError, match="consumer termination was not confirmed"):
+        replica.shutdown()
+    assert closed == [failing, healthy] and replica.servers == [failing]
+
+
+def test_drop_defaulted_engine_args_with_offline_local_model(tmp_path, monkeypatch):
+    import huggingface_hub
+
+    monkeypatch.setattr(huggingface_hub.constants, "HF_HUB_OFFLINE", True)
+    monkeypatch.setattr(server_module, "_ENGINE_ARGS_DEFAULTS", None)
+
+    def reject_download(*args, **kwargs):
+        raise AssertionError("Local model arguments must not trigger a snapshot download")
+
+    monkeypatch.setattr(huggingface_hub.HfApi, "snapshot_download", reject_download)
+    filtered = server_module._drop_defaulted_engine_args(
+        {"model": str(tmp_path), "tensor_parallel_size": 2, "ulysses_mode": "strict"}
+    )
+    assert filtered == {"model": str(tmp_path), "tensor_parallel_size": 2}
 
 
 def test_drop_defaulted_engine_args_keeps_only_explicit_overrides():

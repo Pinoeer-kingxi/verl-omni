@@ -13,6 +13,7 @@
 # limitations under the License.
 import argparse
 import asyncio
+import gc
 import json
 import logging
 import os
@@ -22,6 +23,7 @@ from typing import Any, Optional
 import ray
 import torch
 import vllm_omni.entrypoints.cli.serve
+from verl.utils.device import get_visible_devices_keyword
 from verl.utils.profiler import build_rollout_dist_profiler
 from verl.utils.tracking import RLInsightLogger
 from verl.workers.config import RolloutConfig
@@ -95,7 +97,7 @@ def _drop_defaulted_engine_args(engine_args: dict) -> dict:
     """Keep only explicitly-set engine arguments, dropping upstream defaults."""
     global _ENGINE_ARGS_DEFAULTS
     if _ENGINE_ARGS_DEFAULTS is None:
-        defaults = asdict(OmniEngineArgs(model=""))
+        defaults = asdict(OmniEngineArgs(model=engine_args["model"]))
         defaults.update(asdict(OrchestratorArgs()))
         _ENGINE_ARGS_DEFAULTS = defaults
     defaults = _ENGINE_ARGS_DEFAULTS
@@ -279,6 +281,23 @@ class vLLMOmniHttpServer(vLLMHttpServer):
         """Run headless server in a separate thread."""
         # TODO (mike): support multi node
         raise NotImplementedError("vLLM-Omni headless mode is not implemented yet.")
+
+    async def close_engine(self) -> None:
+        """Finish output-task cancellation before releasing engine references."""
+        engine = getattr(self, "engine", None)
+        if engine is not None:
+            output_task = engine.final_output_task
+            engine.shutdown()
+            if output_task is not None:
+                await asyncio.gather(output_task, return_exceptions=True)
+            del output_task
+        self.engine = None
+        self._server_task = None
+        self._http_server = None
+        del engine
+        # Let completed-task callbacks release their cancellation tracebacks.
+        await asyncio.sleep(0)
+        gc.collect()
 
     async def collective_rpc(
         self,
@@ -597,6 +616,42 @@ class vLLMOmniServerAdapter(ServerAdapter):
         self.zmq_handle = f"ipc:///tmp/rl-colocate-zmq-{job_id}-replica-{self.replica_rank}-rank-{local_rank}.sock"
 
 
+class _ServerWithEarlyDevices:
+    """Supply assigned devices before Ray imports the backend actor class."""
+
+    def __init__(self, actor, options=None):
+        self.actor = actor
+        self.actor_options = dict(options or {})
+
+    def options(self, **options):
+        return type(self)(self.actor, {**self.actor_options, **options})
+
+    def remote(self, *args, **kwargs):
+        runtime_env = self.actor_options.get("runtime_env", {})
+        env_vars = {**runtime_env.get("env_vars", {}), get_visible_devices_keyword(): kwargs["cuda_visible_devices"]}
+        options = {**self.actor_options, "runtime_env": {**runtime_env, "env_vars": env_vars}}
+        return self.actor.options(**options).remote(*args, **kwargs)
+
+
+def _shutdown_omni_server(server):
+    from verl_omni.reward_loop.engine_shutdown import close_http_server
+    from verl_omni.utils.ray_lifecycle import (
+        actor_process_identity,
+        close_actor_gracefully,
+        terminate_actor_and_wait,
+    )
+
+    identity = None
+    try:
+        identity = ray.get(server.__ray_call__.remote(actor_process_identity), timeout=30)
+        close_http_server(server, timeout=30)
+        ray.get(server.close_engine.remote(), timeout=120)
+        close_actor_gracefully(server, identity, timeout=30)
+    except Exception:
+        logger.warning("Graceful Omni shutdown failed; terminating owned processes", exc_info=True)
+        terminate_actor_and_wait(server, identity, timeout=30)
+
+
 class vLLMOmniReplica(vLLMReplica):
     def __init__(
         self,
@@ -617,7 +672,31 @@ class vLLMOmniReplica(vLLMReplica):
             if self.world_size % self.gpus_per_replica_node:
                 raise ValueError(f"Replica size {self.world_size} must be divisible by GPUs per node {gpus_per_node}.")
             self.nnodes = self.world_size // self.gpus_per_replica_node
-        self.server_class = ray.remote(vLLMOmniHttpServer)
+        self.server_class = _ServerWithEarlyDevices(ray.remote(vLLMOmniHttpServer))
+
+    def shutdown(self) -> None:
+        """Stop local inference consumers before training workers release IPC."""
+        kwargs = self.config.engine_kwargs.get("vllm_omni", {}) or {}
+        supported = all(
+            kwargs.get(key, default) in allowed
+            for keys, default, allowed in (
+                (("distributed_executor_backend", "distributed-executor-backend"), "mp", {"mp", "uni"}),
+                (("data_parallel_backend", "data-parallel-backend"), "mp", {"mp"}),
+                (("worker_backend", "worker-backend"), "multi_process", {"multi_process"}),
+            )
+            for key in keys
+        )
+        if not supported or any(kwargs.get(key) for key in ("deploy_config", "stage_configs_path", "pipeline_config")):
+            raise NotImplementedError("Omni shutdown requires owned local mp/uni processes without custom stage config")
+        failures = []
+        for server in list(self.servers):
+            try:
+                _shutdown_omni_server(server)
+                self.servers.remove(server)
+            except Exception as error:
+                failures.append(error)
+        if failures:
+            raise RuntimeError("Omni consumer termination was not confirmed") from failures[0]
 
     # The rollout worker actor class is verl's default
     # (ray.remote(CheckpointEngineWorker)): the omni_delta_sharded backend

@@ -21,7 +21,6 @@ from abc import ABC, abstractmethod
 from typing import Any
 
 from omegaconf import OmegaConf
-from verl.experimental.reward_loop.reward_model import RewardModelManager
 from verl.single_controller.ray.base import split_resource_pool
 
 from verl_omni.workers.config.reward import (
@@ -35,6 +34,8 @@ from verl_omni.workers.config.reward import (
 )
 
 from .accelerator_reward_workers import _IndexedResourcePool
+from .engine_shutdown import RewardEngineManager as RewardModelManager
+from .engine_shutdown import supports_local_shutdown
 from .reward_model_executor import _await_owned
 
 __all__ = [
@@ -73,13 +74,35 @@ class MultiRewardModelManager:
         )
         self.engine_resource_pools = engine_pools
 
-        for name, model in entries:
-            if isinstance(model, EngineRewardModelConfig):
-                self.models[name] = EngineManagedRewardModel(
-                    name, model, base_config, engine_pools.get(name), fallback_model
-                )
-            else:
-                self.models[name] = NativeManagedRewardModel(name, model)
+        try:
+            for name, model in entries:
+                if isinstance(model, EngineRewardModelConfig):
+                    self.models[name] = EngineManagedRewardModel(
+                        name, model, base_config, engine_pools.get(name), fallback_model
+                    )
+                else:
+                    self.models[name] = NativeManagedRewardModel(name, model)
+        except BaseException as error:
+            try:
+                self.shutdown()
+            except Exception as cleanup_error:
+                error.add_note(f"Named reward initialization cleanup also failed: {cleanup_error}")
+            raise
+
+    def shutdown(self) -> None:
+        """Close initialized named vLLM engines after reward work has ended."""
+        failures = []
+        for model in self.models.values():
+            if isinstance(model, EngineManagedRewardModel) and supports_local_shutdown(
+                model.reward_model_manager.config
+            ):
+                try:
+                    model.reward_model_manager.shutdown()
+                except Exception as error:
+                    failures.append(error)
+                    logger.exception("Failed to shut down reward model %s", model.name)
+        if failures:
+            raise RuntimeError("Named reward engine shutdown failed") from failures[0]
 
     @property
     def reward_model_specs(self) -> dict[str, RewardModelSpec]:

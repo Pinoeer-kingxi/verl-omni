@@ -146,14 +146,29 @@ class DiffusionTaskRunnerV1:
 
         # initialize transfer queue inside the Ray task runner
         tq.init(config.transfer_queue)
+        training_error = None
         try:
             trainer_cls = get_diffusion_trainer_cls(config.trainer.v1.trainer_mode)
             self.trainer = trainer_cls(config=config)
             self.trainer.init()
             self.init_agent_loop_manager()
             self.trainer.fit(self.agent_loop_manager)
+        except BaseException as error:
+            training_error = error
+            raise
         finally:
-            tq.close()
+            try:
+                if config.trainer.v1.trainer_mode == "sync" and self.trainer is not None:
+                    from verl_omni.trainer.diffusion.v1.shutdown import close_sync_trainer
+
+                    try:
+                        close_sync_trainer(self.trainer, config.actor_rollout_ref.rollout.name)
+                    except Exception as cleanup_error:
+                        if training_error is None:
+                            raise
+                        training_error.add_note(f"V1 sync shutdown also failed: {cleanup_error}")
+            finally:
+                tq.close()
 
 
 @hydra.main(config_path="./config", config_name="diffusion_trainer", version_base=None)

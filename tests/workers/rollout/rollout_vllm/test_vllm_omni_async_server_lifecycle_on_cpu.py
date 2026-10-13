@@ -35,6 +35,33 @@ _SUCCESS_ACK = SimpleNamespace(status="SUCCESS")
 pytestmark = pytest.mark.asyncio
 
 
+async def test_server_factory_sets_devices_without_mutating_launcher_options(monkeypatch):
+    calls = {}
+
+    class Actor:
+        def options(self, **options):
+            calls["options"] = options
+            return self
+
+        def remote(self, **kwargs):
+            calls["constructor"] = kwargs
+            return "server"
+
+    runtime_env = {"env_vars": {"EXISTING": "kept"}, "worker_process_setup_hook": "pkg.setup"}
+    monkeypatch.setattr(server_module, "get_visible_devices_keyword", lambda: "CUDA_VISIBLE_DEVICES")
+    factory = server_module._ServerWithEarlyDevices(Actor())
+    configured = factory.options(name="owned-server", runtime_env=runtime_env)
+    assert configured.remote(cuda_visible_devices="GPU-assigned", replica_rank=2) == "server"
+    assert calls["options"]["name"] == "owned-server"
+    assert calls["options"]["runtime_env"] == {
+        "env_vars": {"EXISTING": "kept", "CUDA_VISIBLE_DEVICES": "GPU-assigned"},
+        "worker_process_setup_hook": "pkg.setup",
+    }
+    assert calls["constructor"] == {"cuda_visible_devices": "GPU-assigned", "replica_rank": 2}
+    assert runtime_env == {"env_vars": {"EXISTING": "kept"}, "worker_process_setup_hook": "pkg.setup"}
+    assert factory.actor_options == {}
+
+
 class _FakeRequestState:
     def __init__(self, request_id: str, external_request_id: str):
         self.request_id = request_id
