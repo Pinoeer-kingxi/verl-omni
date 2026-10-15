@@ -506,7 +506,12 @@ async def test_native_model_delegates_lifecycle_to_bound_workers():
 
 
 @pytest.mark.asyncio
-async def test_cpu_native_resident_model_sends_wake_for_each_phase():
+@pytest.mark.parametrize(
+    ("placement", "wake_count"),
+    [({"resource": "cpu", "num_replicas": 1}, 2), ({"devices": [0]}, 1)],
+    ids=["cpu", "accelerator"],
+)
+async def test_native_resident_model_wake_policy(placement, wake_count):
     calls = []
 
     class _RemoteMethod:
@@ -533,7 +538,7 @@ async def test_cpu_native_resident_model_sends_wake_for_each_phase():
                 "offload": False,
                 "executor": {"model": "tests.fake:Model"},
                 "model_path": "/models/pickscore",
-                "placement": {"resource": "cpu", "num_replicas": 1},
+                "placement": placement,
             }
         ),
     )
@@ -543,7 +548,7 @@ async def test_cpu_native_resident_model_sends_wake_for_each_phase():
     await model.sleep()
     await model.wake_up()
 
-    assert calls == [("wake", "pickscore"), ("wake", "pickscore")]
+    assert calls == [("wake", "pickscore")] * wake_count
 
 
 @pytest.mark.parametrize(
