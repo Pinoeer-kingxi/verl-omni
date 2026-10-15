@@ -14,7 +14,6 @@
 """CPU-native reward placement and executor contracts."""
 
 import asyncio
-import time
 from threading import Event
 from types import SimpleNamespace
 
@@ -26,11 +25,7 @@ from verl import DataProto
 from verl_omni.reward_loop import reward_loop as loop_module
 from verl_omni.reward_loop import reward_model_executor as executor_module
 from verl_omni.reward_loop.reward_loop import OmniRewardLoopManager
-from verl_omni.reward_loop.reward_model import (
-    EngineManagedRewardModel,
-    MultiRewardModelManager,
-    NativeManagedRewardModel,
-)
+from verl_omni.reward_loop.reward_model import MultiRewardModelManager, NativeManagedRewardModel
 from verl_omni.reward_loop.reward_model_executor import NativeRewardExecutor
 from verl_omni.workers.config.reward import RewardModelSpec, parse_reward_model_config, reward_role_required
 
@@ -260,13 +255,11 @@ async def test_cpu_phase_submission_failure_drains_accepted_rpc_before_sleep():
     async def wake_up():
         calls.append("wake_up")
 
-    async def sleep(*, native_timeout=None):
+    async def sleep():
         calls.append("sleep")
 
     manager = object.__new__(OmniRewardLoopManager)
     manager._score_lock = asyncio.Lock()
-    manager._scoring_unusable = False
-    manager._shared_worker_process_identities = {}
     manager._reward_dispatch_batch_sizes = {}
     manager._reward_worker_groups = {
         "quality": [
@@ -290,7 +283,7 @@ async def test_cpu_phase_submission_failure_drains_accepted_rpc_before_sleep():
     assert calls == ["wake_up", "score_finished", "sleep"]
 
 
-def test_shared_worker_identity_is_recorded_before_native_cpus_are_reserved(monkeypatch):
+def test_shared_workers_start_before_native_cpus_are_reserved(monkeypatch):
     model_config = {
         "backend": "native",
         "placement": {"resource": "cpu", "num_replicas": 1},
@@ -311,13 +304,11 @@ def test_shared_worker_identity_is_recorded_before_native_cpus_are_reserved(monk
         }
     )
     calls = []
-    identity = {"pid": 17, "created": 23.0, "node_id": "owned-node"}
 
-    def capture(callback):
-        calls.append("shared_identity")
-        return identity
+    def ready():
+        calls.append("shared_ready")
 
-    shared = SimpleNamespace(__ray_call__=SimpleNamespace(remote=capture))
+    shared = SimpleNamespace(__ray_ready__=SimpleNamespace(remote=ready))
 
     def reserve_native(*args):
         calls.append("native_cpu_reserved")
@@ -336,227 +327,4 @@ def test_shared_worker_identity_is_recorded_before_native_cpus_are_reserved(monk
     monkeypatch.setattr(loop_module.ray, "remote", lambda cls: cls)
     monkeypatch.setattr(loop_module.ray, "get", lambda refs: refs)
     manager._init_reward_loop_workers()
-    assert calls == ["shared_identity", "native_cpu_reserved"]
-    assert manager._shared_worker_process_identities == {id(shared): identity}
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("trigger", ["cancel", "timeout", "rpc_error", "submission_error"])
-@pytest.mark.parametrize("confirmed", [False, True])
-async def test_never_returning_rpc_has_bounded_cleanup_and_retains_model_until_stopped(monkeypatch, trigger, confirmed):
-    calls = []
-    entered = asyncio.Event()
-    request = None
-
-    async def score(data):
-        entered.set()
-        await asyncio.Event().wait()
-
-    def submit(data):
-        nonlocal request
-        request = asyncio.create_task(score(data))
-        return request
-
-    async def failed(data):
-        raise ValueError("scoring failed")
-
-    def failed_submit(data):
-        raise ValueError("submission failed")
-
-    worker = SimpleNamespace(compute_score_batch=SimpleNamespace(remote=submit))
-    workers = [worker]
-    if trigger not in ("cancel", "timeout"):
-        workers.append(
-            SimpleNamespace(
-                compute_score_batch=SimpleNamespace(remote=failed if trigger == "rpc_error" else failed_submit)
-            )
-        )
-    model = NativeManagedRewardModel(
-        "quality",
-        {
-            "backend": "native",
-            "placement": {"resource": "cpu", "num_replicas": 1},
-            "executor": {"model": "tests.fake:CpuModel"},
-        },
-    )
-    model.bind_workers(workers)
-    model._worker_process_identities[id(worker)] = {"owned": True}
-
-    async def wake():
-        pass
-
-    async def sleep(*, native_timeout=None):
-        assert calls == ["terminate", "stopped"]
-        assert worker not in model._workers
-        calls.append("sleep")
-
-    def terminate(actor, identity, timeout):
-        assert actor is worker
-        assert identity == {"owned": True}
-        calls.append("terminate")
-        time.sleep(0.005)
-        if not confirmed:
-            raise TimeoutError("worker termination unconfirmed")
-        calls.append("stopped")
-
-    monkeypatch.setattr(loop_module, "_SCORING_DRAIN_TIMEOUT", 0.02)
-    monkeypatch.setattr(loop_module, "terminate_actor_and_wait", terminate)
-    manager = object.__new__(OmniRewardLoopManager)
-    manager._score_lock = asyncio.Lock()
-    manager._scoring_unusable = False
-    manager._shared_worker_process_identities = {}
-    manager._reward_worker_groups = {"quality": workers}
-    manager._reward_dispatch_batch_sizes = {}
-    manager.multi_reward_model_manager = SimpleNamespace(
-        models={"quality": model},
-        wake_up=wake,
-        sleep=sleep,
-        has_engine_model=False,
-    )
-    operation = manager.async_compute_rm_score(DataProto.from_dict(tensors={"id": torch.arange(2)}))
-    scoring = asyncio.create_task(asyncio.wait_for(operation, timeout=0.02) if trigger == "timeout" else operation)
-    await asyncio.wait_for(entered.wait(), timeout=0.5)
-    started = time.monotonic()
-    if trigger == "cancel":
-        scoring.cancel()
-        await asyncio.sleep(0.005)
-        scoring.cancel()
-    completed, _ = await asyncio.wait({scoring}, timeout=0.25)
-    assert completed, "Cleanup deadline must bound a scoring RPC that never returns"
-    result = (await asyncio.gather(scoring, return_exceptions=True))[0]
-    assert time.monotonic() - started < 0.25
-    assert not manager._score_lock.locked()
-    assert request.cancelled()
-    if confirmed:
-        assert calls == ["terminate", "stopped", "sleep"]
-        expected_error = {"cancel": asyncio.CancelledError, "timeout": TimeoutError}.get(trigger, ValueError)
-        assert isinstance(result, expected_error)
-    else:
-        assert calls == ["terminate"]
-        assert isinstance(result, RuntimeError)
-        assert "termination could not be confirmed" in str(result)
-    with pytest.raises(RuntimeError, match="recreate the reward manager"):
-        await manager.async_compute_rm_score(DataProto.from_dict(tensors={"id": torch.arange(2)}))
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("method", ["wake_up", "sleep"])
-async def test_engine_lifecycle_awaits_existing_replica_methods_concurrently(method):
-    entered = set()
-    all_entered = asyncio.Event()
-
-    def replica(index):
-        async def lifecycle():
-            entered.add(index)
-            if len(entered) == 2:
-                all_entered.set()
-            await all_entered.wait()
-
-        return SimpleNamespace(**{method: lifecycle})
-
-    model = object.__new__(EngineManagedRewardModel)
-    model.offload = True
-    model.reward_model_manager = SimpleNamespace(rollout_replicas=[replica(0), replica(1)])
-    await asyncio.wait_for(getattr(model, method)(), timeout=0.5)
-    assert entered == {0, 1}
-
-
-@pytest.mark.parametrize("failure", ["error", "timeout"])
-def test_sync_scoring_engine_sleep_failure_is_bounded_without_executor_threads(monkeypatch, failure):
-    import threading
-
-    calls = []
-    replica_sleep_finished = []
-
-    async def wake():
-        calls.append("wake")
-
-    async def sleep(*, native_timeout=None):
-        calls.append("sleep")
-        try:
-            if failure == "error":
-                raise ValueError("injected replica sleep failure")
-            await asyncio.Event().wait()
-        finally:
-            replica_sleep_finished.append(True)
-
-    def synchronous_sleep():
-        # The previous bridge outlived wait_for and delayed asyncio.run exit.
-        time.sleep(0.6)
-
-    engine = object.__new__(EngineManagedRewardModel)
-    engine.offload = True
-    engine.spec = RewardModelSpec(name="ocr", backend="engine")
-    engine.reward_model_manager = SimpleNamespace(
-        rollout_replicas=[SimpleNamespace(wake_up=wake, sleep=sleep)],
-        wake_up=lambda: None,
-        sleep=synchronous_sleep,
-    )
-    models = object.__new__(MultiRewardModelManager)
-    models.models = {"ocr": engine}
-    manager = object.__new__(OmniRewardLoopManager)
-    manager._score_lock = asyncio.Lock()
-    manager._scoring_unusable = False
-    manager.multi_reward_model_manager = models
-
-    async def score(data):
-        calls.append("score")
-        return data
-
-    manager._compute_named_model_scores = score
-    monkeypatch.setattr(loop_module, "_MODEL_SLEEP_TIMEOUT", 0.02)
-    threads_before = set(threading.enumerate())
-    started = time.monotonic()
-    with pytest.raises(RuntimeError, match="Reward model cleanup failed") as caught:
-        manager.compute_rm_score(object())
-    assert time.monotonic() - started < 0.3
-    assert isinstance(caught.value.__cause__, ValueError if failure == "error" else TimeoutError)
-    assert calls == ["wake", "score", "sleep"]
-    assert replica_sleep_finished == [True]
-    assert set(threading.enumerate()) <= threads_before
-    assert not manager._score_lock.locked()
-    assert manager._scoring_unusable
-    with pytest.raises(RuntimeError, match="recreate the reward manager"):
-        manager.compute_rm_score(object())
-
-
-@pytest.mark.parametrize("blocked", ["lock", "rpc"])
-def test_sync_native_sleep_deadline_remains_bounded_with_owned_cancellation(monkeypatch, blocked):
-    finished = []
-
-    async def stalled_sleep():
-        try:
-            await asyncio.Event().wait()
-        finally:
-            finished.append(True)
-
-    model = NativeManagedRewardModel(
-        "quality",
-        {
-            "backend": "native",
-            "placement": {"resource": "cpu", "num_replicas": 1},
-            "executor": {"model": "tests.fake:CpuModel"},
-        },
-    )
-    model.bind_workers([SimpleNamespace(sleep_reward_model=SimpleNamespace(remote=lambda name: stalled_sleep()))])
-    if blocked == "lock":
-        model._lifecycle_lock = asyncio.Lock()
-        asyncio.run(model._lifecycle_lock.acquire())
-    models = object.__new__(MultiRewardModelManager)
-    models.models = {"quality": model}
-    manager = object.__new__(OmniRewardLoopManager)
-    manager._score_lock = asyncio.Lock()
-    manager._scoring_unusable = False
-    manager.multi_reward_model_manager = models
-    manager._compute_named_model_scores = lambda data: asyncio.sleep(0, result=data)
-    models.wake_up = lambda: asyncio.sleep(0)
-    monkeypatch.setattr(loop_module, "_MODEL_SLEEP_TIMEOUT", 0.02)
-    started = time.monotonic()
-    with pytest.raises(RuntimeError, match="Reward model cleanup failed"):
-        manager.compute_rm_score(object())
-    assert time.monotonic() - started < 0.3
-    assert manager._scoring_unusable and not manager._score_lock.locked()
-    assert model._workers
-    assert finished == ([] if blocked == "lock" else [True])
-    if blocked == "lock":
-        model._lifecycle_lock.release()
+    assert calls == ["shared_ready", "native_cpu_reserved"]

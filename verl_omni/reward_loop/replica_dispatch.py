@@ -18,9 +18,7 @@ import asyncio
 from verl.protocol import DataProto, pad_dataproto_to_divisor
 
 
-async def dispatch_reward_groups(
-    data: DataProto, worker_groups: dict, batch_sizes: dict[str, int], *, drain_requests=None
-) -> dict[str, list]:
+async def dispatch_reward_groups(data: DataProto, worker_groups: dict, batch_sizes: dict[str, int]) -> dict[str, list]:
     """Score groups, restore sample order and drain accepted RPCs before returning.
 
     Groups absent from ``batch_sizes`` retain static padded splitting. Other
@@ -31,7 +29,6 @@ async def dispatch_reward_groups(
     next_index = {}
     static_chunks = {}
     stopped = False
-    accepted = []
     for name, workers in worker_groups.items():
         if not workers:
             raise ValueError(f"Reward worker group {name!r} has no replicas")
@@ -58,9 +55,7 @@ async def dispatch_reward_groups(
                     stop = min(start + batch_sizes[name], len(data))
                     next_index[name] = stop
                     chunk = data[start:stop]
-                request = asyncio.ensure_future(worker.compute_score_batch.remote(chunk))
-                accepted.append((worker, request))
-                result = await request
+                result = await worker.compute_score_batch.remote(chunk)
                 if len(result) != len(chunk):
                     raise ValueError(
                         f"Reward worker group {name!r} returned {len(result)} results for {len(chunk)} samples"
@@ -69,10 +64,7 @@ async def dispatch_reward_groups(
                 if name in static_chunks:
                     break
         except BaseException:
-            first_failure = not stopped
             stopped = True
-            if first_failure and drain_requests is not None and accepted:
-                await drain_requests(accepted)
             raise
 
     pending = asyncio.gather(
@@ -90,16 +82,10 @@ async def dispatch_reward_groups(
             break
         except asyncio.CancelledError as exc:
             # Remote work can outlive a cancelled await; keep its ownership until completion.
-            first_failure = not stopped
             stopped = True
             cancellation = exc
-            if first_failure and drain_requests is not None and accepted:
-                await drain_requests(accepted)
     if cancellation is not None:
         raise cancellation
-    for result in results:
-        if isinstance(result, Exception):
-            raise result
     for result in results:
         if isinstance(result, BaseException):
             raise result

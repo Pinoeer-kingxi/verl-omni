@@ -20,7 +20,6 @@ from threading import Event
 from types import SimpleNamespace
 from uuid import uuid4
 
-import psutil
 import pytest
 import ray
 import torch
@@ -453,59 +452,5 @@ def test_cpu_phase_cancellation_drains_accepted_samples_before_sleep(tmp_path, m
         asyncio.run(run())
         recovered = manager.compute_rm_score(_full_data())
         torch.testing.assert_close(recovered.batch["rm_scores"], torch.tensor([[1.25], [1.75], [2.25]]))
-    finally:
-        ray.shutdown()
-
-
-@pytest.mark.parametrize("stall_shared_worker", [False, True])
-def test_cpu_scoring_that_never_returns_exits_after_repeated_cancellation(tmp_path, monkeypatch, stall_shared_worker):
-    from verl_omni.reward_loop import reward_loop
-
-    monkeypatch.setattr(OmniRewardLoopManager, "_create_native_workers", _controlled_native_workers)
-    if stall_shared_worker:
-        original_shared = OmniRewardLoopManager._create_node_affinity_workers
-
-        def controlled_shared(manager, *args, **kwargs):
-            original_class = manager.reward_loop_workers_class
-            manager.reward_loop_workers_class = ray.remote(_RestartableRewardWorker)
-            try:
-                return original_shared(manager, *args, **kwargs)
-            finally:
-                manager.reward_loop_workers_class = original_class
-
-        monkeypatch.setattr(OmniRewardLoopManager, "_create_node_affinity_workers", controlled_shared)
-    monkeypatch.setattr(reward_loop, "_SCORING_DRAIN_TIMEOUT", 0.05)
-    ray.init(num_cpus=4, num_gpus=0, include_dashboard=False, object_store_memory=128 * 1024**2)
-    try:
-        manager = OmniRewardLoopManager(_full_config(tmp_path, True))
-        data = _full_data()
-        data.non_tensor_batch["reward_model"][1] = {"ground_truth": "delay"}
-        worker = manager._reward_worker_groups["quality"][0]
-        shared_worker = manager._reward_worker_groups["shared"][0]
-        shared_pid = manager._shared_worker_process_identities[id(shared_worker)]["pid"]
-        pid = ray.get(worker.worker_pid.remote())
-
-        async def run():
-            scoring = asyncio.create_task(manager.async_compute_rm_score(data))
-            await asyncio.wait_for(worker.wait_for_delayed_sample.remote(), timeout=30)
-            if stall_shared_worker:
-                await asyncio.wait_for(shared_worker.wait_for_delayed_sample.remote(), timeout=30)
-            started = time.monotonic()
-            scoring.cancel()
-            while not scoring.done() and time.monotonic() - started < 40:
-                await asyncio.sleep(0.05)
-                scoring.cancel()
-            assert scoring.done(), "Repeated cancellation must not reset the cleanup deadline"
-            result = (await asyncio.gather(scoring, return_exceptions=True))[0]
-            assert isinstance(result, asyncio.CancelledError), result
-            assert not manager._score_lock.locked()
-            assert manager._scoring_unusable
-            assert not psutil.pid_exists(pid) or psutil.Process(pid).status() == psutil.STATUS_ZOMBIE
-            if stall_shared_worker:
-                assert not psutil.pid_exists(shared_pid) or psutil.Process(shared_pid).status() == psutil.STATUS_ZOMBIE
-            with pytest.raises(RuntimeError, match="recreate the reward manager"):
-                await manager.async_compute_rm_score(_full_data())
-
-        asyncio.run(run())
     finally:
         ray.shutdown()

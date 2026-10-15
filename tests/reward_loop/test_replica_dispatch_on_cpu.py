@@ -226,7 +226,6 @@ async def test_worker_failure_stops_all_groups_and_drains_accepted_remote_calls(
 
 @pytest.mark.asyncio
 async def test_synchronous_remote_failure_drains_an_active_peer_without_new_dispatch():
-    peer_submitted = asyncio.Event()
     peer_entered = asyncio.Event()
     release_peer = asyncio.Event()
     peer_calls = []
@@ -240,19 +239,15 @@ async def test_synchronous_remote_failure_drains_an_active_peer_without_new_disp
 
     class FailingRemote:
         def remote(self, data):
-            assert peer_submitted.is_set()
+            assert peer_entered.is_set()
             failure_calls.append(_sample_ids(data))
             raise RuntimeError("remote submission failed")
-
-    def submit_peer(data):
-        peer_submitted.set()
-        return asyncio.create_task(peer(data))
 
     task = asyncio.create_task(
         dispatch_reward_groups(
             _data(4),
             {
-                "peer": [SimpleNamespace(compute_score_batch=SimpleNamespace(remote=submit_peer))],
+                "peer": [_worker(peer)],
                 "failing": [SimpleNamespace(compute_score_batch=FailingRemote())],
             },
             {"peer": 1, "failing": 1},

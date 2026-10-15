@@ -1276,7 +1276,7 @@ async def test_mixed_group_failure_drains_all_sample_work_before_lifecycle_sleep
     async def wake_up():
         calls.append("wake_up")
 
-    async def sleep(*, native_timeout=None):
+    async def sleep():
         calls.append("sleep")
 
     shared_worker.compute_score = compute_shared_sample
@@ -1288,9 +1288,7 @@ async def test_mixed_group_failure_drains_all_sample_work_before_lifecycle_sleep
     )
     manager = object.__new__(OmniRewardLoopManager)
     manager._score_lock = asyncio.Lock()
-    manager._scoring_unusable = False
     manager._reward_dispatch_batch_sizes = {"native": 2}
-    manager._scoring_unusable = False
     manager._reward_worker_groups = {"shared": [shared_handle], "native": [native_handle]}
     manager.multi_reward_model_manager = SimpleNamespace(
         models={"engine": object(), "native": object()},
@@ -1358,12 +1356,11 @@ async def test_async_compute_rm_score_brackets_scoring_with_one_lifecycle():
     calls = []
     manager = object.__new__(OmniRewardLoopManager)
     manager._score_lock = asyncio.Lock()
-    manager._scoring_unusable = False
 
     async def wake_up():
         calls.append("wake_up")
 
-    async def sleep(*, native_timeout=None):
+    async def sleep():
         calls.append("sleep")
 
     async def score(data):
@@ -1390,12 +1387,11 @@ async def test_async_compute_rm_score_serializes_lifecycle_brackets():
     release_first_score = asyncio.Event()
     manager = object.__new__(OmniRewardLoopManager)
     manager._score_lock = asyncio.Lock()
-    manager._scoring_unusable = False
 
     async def wake_up():
         calls.append("wake_up")
 
-    async def sleep(*, native_timeout=None):
+    async def sleep():
         calls.append("sleep")
 
     async def score(data):
@@ -1515,12 +1511,11 @@ async def test_named_model_failure_drains_active_rpc_before_lifecycle_sleep():
     async def wake_up():
         calls.append("wake_up")
 
-    async def sleep(*, native_timeout=None):
+    async def sleep():
         calls.append("sleep")
 
     manager = object.__new__(OmniRewardLoopManager)
     manager._score_lock = asyncio.Lock()
-    manager._scoring_unusable = False
     manager._reward_dispatch_batch_sizes = {"native": 1}
     manager._reward_worker_groups = {
         "native": [
@@ -1564,12 +1559,11 @@ async def test_named_model_repeated_cancellation_drains_active_rpcs_before_lifec
     async def wake_up():
         calls.append("wake_up")
 
-    async def sleep(*, native_timeout=None):
+    async def sleep():
         calls.append("sleep")
 
     manager = object.__new__(OmniRewardLoopManager)
     manager._score_lock = asyncio.Lock()
-    manager._scoring_unusable = False
     manager._reward_dispatch_batch_sizes = {"native": 1}
     manager._reward_worker_groups = {"native": [blocking_worker(0), blocking_worker(1)]}
     manager.multi_reward_model_manager = SimpleNamespace(
@@ -1624,7 +1618,6 @@ async def test_cancellation_during_lifecycle_drains_before_releasing_score_lock(
     }
     manager = object.__new__(OmniRewardLoopManager)
     manager._score_lock = asyncio.Lock()
-    manager._scoring_unusable = False
     manager.multi_reward_model_manager = models
 
     async def score(data):
@@ -1734,7 +1727,7 @@ async def test_model_wake_failure_drains_other_model_before_sleep():
         await entered.wait()
         raise RuntimeError("wake failed")
 
-    async def sleep(*, native_timeout=None):
+    async def sleep():
         assert completed.is_set()
         calls.append("sleep")
 
@@ -1745,7 +1738,6 @@ async def test_model_wake_failure_drains_other_model_before_sleep():
     }
     manager = object.__new__(OmniRewardLoopManager)
     manager._score_lock = asyncio.Lock()
-    manager._scoring_unusable = False
     manager.multi_reward_model_manager = models
     manager._compute_named_model_scores = AsyncMock()
     task = asyncio.create_task(manager.async_compute_rm_score("unused"))

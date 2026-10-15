@@ -433,13 +433,9 @@ alongside engine and accelerator-native deployments.
 
 Each scoring phase wakes its worker-local models and, when `offload=true`,
 unloads them after all accepted scoring calls finish. A scoring failure or
-caller cancellation waits up to 30 seconds for accepted calls to finish. If
-calls remain stuck, cleanup has a separate 30-second worker termination
-deadline and confirms the owned actor and subprocesses stopped before unloading.
-Unconfirmed termination raises a cleanup error and skips model unloading.
-Forced termination requires recreating the reward manager; it does not retry
-scoring. Model sleep has a 30-second deadline as well. Repeated cancellation
-does not extend these deadlines.
+caller cancellation also waits for accepted calls before unloading. This wait
+has no timeout: a scoring RPC that never returns can block cleanup. CPU
+placement does not add forced worker termination or automatic retries.
 
 With `offload=false`, models remain resident. If a deployment explicitly enables
 Ray actor restarts, the next scoring phase initializes a restarted actor again.

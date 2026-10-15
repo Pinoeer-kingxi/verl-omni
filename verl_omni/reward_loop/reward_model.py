@@ -108,16 +108,10 @@ class MultiRewardModelManager:
             if isinstance(result, BaseException):
                 raise result
 
-    async def sleep(self, native_timeout: float | None = None) -> None:
+    async def sleep(self) -> None:
         """Attempt to sleep every model and report the first lifecycle error."""
         models = list(reversed(self.models.values()))
-        results = await asyncio.gather(
-            *(
-                model.sleep(timeout=native_timeout) if isinstance(model, NativeManagedRewardModel) else model.sleep()
-                for model in models
-            ),
-            return_exceptions=True,
-        )
+        results = await asyncio.gather(*(model.sleep() for model in models), return_exceptions=True)
         errors = []
         for model, result in zip(models, results, strict=True):
             if isinstance(result, BaseException):
@@ -251,11 +245,11 @@ class EngineManagedRewardModel(ManagedRewardModel):
 
     async def wake_up(self) -> None:
         if self.offload:
-            await asyncio.gather(*(replica.wake_up() for replica in self.reward_model_manager.rollout_replicas))
+            await asyncio.to_thread(self.reward_model_manager.wake_up)
 
     async def sleep(self) -> None:
         if self.offload:
-            await asyncio.gather(*(replica.sleep() for replica in self.reward_model_manager.rollout_replicas))
+            await asyncio.to_thread(self.reward_model_manager.sleep)
 
 
 class NativeManagedRewardModel(ManagedRewardModel):
@@ -279,7 +273,6 @@ class NativeManagedRewardModel(ManagedRewardModel):
             offload=offload,
         )
         self._workers = None
-        self._worker_process_identities = {}
         self._resident = False
         self._closed = False
         self._lifecycle_lock = asyncio.Lock()
@@ -303,10 +296,6 @@ class NativeManagedRewardModel(ManagedRewardModel):
         for result in results:
             if isinstance(result, BaseException):
                 raise result
-        if method == "wake_up_reward_model":
-            self._worker_process_identities = {
-                id(worker): identity for worker, identity in zip(self._workers, results, strict=True)
-            }
 
     async def wake_up(self) -> None:
         await _await_owned(self._wake_up())
@@ -320,18 +309,17 @@ class NativeManagedRewardModel(ManagedRewardModel):
             await self._run_worker_lifecycle("wake_up_reward_model")
             self._resident = True
 
-    async def sleep(self, timeout: float | None = None) -> None:
-        await _await_owned(self._sleep(timeout))
+    async def sleep(self) -> None:
+        await _await_owned(self._sleep())
 
-    async def _sleep(self, timeout: float | None = None) -> None:
-        async with asyncio.timeout(timeout):
-            async with self._lifecycle_lock:
-                if self._closed:
-                    return
-                if not self.offload:
-                    return
-                await self._run_worker_lifecycle("sleep_reward_model")
-                self._resident = False
+    async def _sleep(self) -> None:
+        async with self._lifecycle_lock:
+            if self._closed:
+                return
+            if not self.offload:
+                return
+            await self._run_worker_lifecycle("sleep_reward_model")
+            self._resident = False
 
     async def close(self) -> None:
         await _await_owned(self._close())
