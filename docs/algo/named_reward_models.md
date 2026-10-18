@@ -423,7 +423,7 @@ reward:
       name: compute_quality_score
 ```
 
-CPU native models receive `torch.device("cpu")` in their executor. An explicit
+CPU native executors default to `torch.device("cpu")`. An explicit
 `executor.kwargs.device` must use CPU for CPU placement, or the current
 accelerator type for accelerator placement. A mismatch is rejected before
 workers are created. `placement.devices` is reserved for accelerator bundle

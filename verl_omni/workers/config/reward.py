@@ -85,12 +85,7 @@ class RewardModelPlacementConfig(BaseConfig):
             raise ValueError("Native reward model placement.devices must contain non-negative integers")
         if len(set(self.devices)) != len(self.devices):
             raise ValueError("Native reward model placement.devices must not contain duplicates")
-        if (
-            isinstance(self.cpus_per_worker, bool)
-            or not isinstance(self.cpus_per_worker, int)
-            or self.cpus_per_worker <= 0
-        ):
-            raise ValueError("Native reward model placement.cpus_per_worker must be a positive integer")
+        _validate_positive_int(self.cpus_per_worker, "Native reward model placement.cpus_per_worker")
         if self.resource == "accelerator" and self.cpus_per_worker != 1:
             raise ValueError("Native reward model placement.cpus_per_worker is only supported for resource='cpu'")
 

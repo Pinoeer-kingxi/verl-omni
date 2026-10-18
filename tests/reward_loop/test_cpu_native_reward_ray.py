@@ -35,13 +35,10 @@ from verl_omni.workers.config.reward import RewardModelSpec, parse_reward_model_
 
 
 class _CpuModel:
-    instances = []
-
     def __init__(self, model_path, device):
         self.model_path = model_path
         self.device = device
         self.closed = False
-        self.__class__.instances.append(self)
 
     def infer(self, value):
         return value + 1

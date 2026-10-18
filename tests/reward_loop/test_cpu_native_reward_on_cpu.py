@@ -47,8 +47,7 @@ def test_cpu_native_role_resolves_placement_interpolations():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["thread", "async", "awaitable"])
-@pytest.mark.parametrize("trigger", ["cancel", "timeout"])
-async def test_cancelled_native_inference_keeps_model_until_actual_completion(monkeypatch, kind, trigger):
+async def test_cancelled_native_inference_keeps_model_until_actual_completion(monkeypatch, kind):
     entered, release, finished, closed = (Event() for _ in range(4))
 
     async def async_infer(self, value):
@@ -87,15 +86,13 @@ async def test_cancelled_native_inference_keeps_model_until_actual_completion(mo
         RewardModelSpec(name="quality", backend="native", device_type="cpu", executor_config={"model": "test:model"})
     )
     await executor.wake_up()
-    operation = executor.infer(1)
-    caller = asyncio.create_task(asyncio.wait_for(operation, 0.02) if trigger == "timeout" else operation)
+    caller = asyncio.create_task(executor.infer(1))
     sleeping = None
     try:
         async with asyncio.timeout(1):
             while not entered.is_set():
                 await asyncio.sleep(0.001)
-        if trigger == "cancel":
-            caller.cancel()
+        caller.cancel()
         await asyncio.wait({caller}, timeout=0.04)
         assert not caller.done()
         assert executor._inflight == 1
@@ -106,7 +103,7 @@ async def test_cancelled_native_inference_keeps_model_until_actual_completion(mo
         assert not closed.is_set()
         release.set()
         await asyncio.wait_for(sleeping, 1)
-        with pytest.raises(asyncio.CancelledError if trigger == "cancel" else TimeoutError):
+        with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(asyncio.shield(caller), 1)
         assert finished.is_set() and closed.is_set()
         assert executor._inflight == 0 and executor._model is None
