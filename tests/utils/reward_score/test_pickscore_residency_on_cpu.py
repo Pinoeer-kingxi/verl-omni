@@ -54,11 +54,11 @@ async def test_opt_in_moves_same_model_between_cpu_and_explicit_cuda(monkeypatch
             return self
 
     weights = Weights()
-    inferencer = SimpleNamespace(
-        model=weights,
-        processor=SimpleNamespace(tokenizer=SimpleNamespace()),
-        device=torch.device("cuda:2"),
-    )
+    inferencer = type(
+        "Inferencer",
+        (),
+        {"model": weights, "processor": SimpleNamespace(tokenizer=SimpleNamespace()), "device": torch.device("cuda:2")},
+    )()
     monkeypatch.setattr(module, "_PickScoreInferencer", lambda **kwargs: inferencer)
     model = module.PickScoreNativeModel(device="cuda:2", retain_weights_on_cpu=True)
     assert model.supports_cpu_offload

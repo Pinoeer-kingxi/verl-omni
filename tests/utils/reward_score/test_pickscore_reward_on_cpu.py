@@ -14,7 +14,9 @@
 """CPU tests for PickScore burst batching and prompt deduplication."""
 
 import asyncio
+import gc
 import importlib.util
+import weakref
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -241,6 +243,33 @@ async def test_native_model_close_releases_native_tokenizer_decode_wrapper(monke
     assert "decode" not in vars(backend)
     assert backend.decode([1]) == "hello"
     assert not hasattr(model, "_inferencer")
+
+
+@pytest.mark.asyncio
+async def test_native_model_close_collects_native_tokenizer_cycle(monkeypatch):
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+
+    def make_inferencer():
+        backend = Tokenizer(WordLevel({"[UNK]": 0}, unk_token="[UNK]"))
+        original_decode = backend.decode
+
+        def decode(*args, **kwargs):
+            return original_decode(*args, **kwargs)
+
+        backend.decode = decode
+        inferencer = _FakeInferencer()
+        inferencer.processor.tokenizer.backend_tokenizer = backend
+        return inferencer, weakref.ref(decode)
+
+    inferencer, wrapper = make_inferencer()
+    pending = [inferencer]
+    monkeypatch.setattr(pickscore_reward, "_PickScoreInferencer", lambda **kwargs: pending.pop())
+    model = pickscore_reward.PickScoreNativeModel(device="cpu")
+    await model.close()
+    del model, inferencer
+    gc.collect()
+    assert wrapper() is None
 
 
 @pytest.mark.asyncio

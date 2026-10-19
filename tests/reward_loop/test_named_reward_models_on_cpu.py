@@ -511,7 +511,7 @@ async def test_native_model_delegates_lifecycle_to_bound_workers():
     [({"resource": "cpu", "num_replicas": 1}, 2), ({"devices": [0]}, 1)],
     ids=["cpu", "accelerator"],
 )
-async def test_native_resident_model_wake_policy(placement, wake_count):
+async def test_native_model_can_stay_resident(placement, wake_count):
     calls = []
 
     class _RemoteMethod:
