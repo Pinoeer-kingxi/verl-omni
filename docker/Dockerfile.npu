@@ -1,4 +1,15 @@
-FROM quay.io/ascend/cann:9.1.0-a3-ubuntu22.04-py3.12
+ARG NPU_DEVICE=a3
+
+FROM quay.io/ascend/cann:9.1.0-910b-ubuntu22.04-py3.12 AS base-a2
+ENV SOC_VERSION=ascend910b1
+
+FROM quay.io/ascend/cann:9.1.0-a3-ubuntu22.04-py3.12 AS base-a3
+ENV SOC_VERSION=ascend910_9391
+
+FROM swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:9.1.0-950-ubuntu22.04-py3.12 AS base-a5
+ENV SOC_VERSION=ascend950dt_9582
+
+FROM base-${NPU_DEVICE} AS runtime
 
 ARG PIP_INDEX_URL="https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple"
 ARG ASCEND_PIP_INDEX_URL="https://mirrors.huaweicloud.com/ascend/repos/pypi"
@@ -22,14 +33,12 @@ ARG VERL_REF=""
 ARG VERL_OMNI_REPO="https://github.com/verl-project/verl-omni.git"
 ARG VERL_OMNI_REF="main"
 
-ARG SOC_VERSION="ascend910_9391"
 ARG COMPILE_CUSTOM_KERNELS=1
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    SOC_VERSION=${SOC_VERSION} \
     COMPILE_CUSTOM_KERNELS=${COMPILE_CUSTOM_KERNELS} \
     TASK_QUEUE_ENABLE=1 \
     OMP_NUM_THREADS=1 \

@@ -20,6 +20,8 @@ import torch
 from peft import LoraConfig
 from verl.utils.py_functional import convert_to_regular_types
 
+from verl_omni.utils.config import resolve_lora_config
+
 logger = logging.getLogger(__name__)
 
 
@@ -27,10 +29,11 @@ class LoRAAdapterMixin:
     """Backend-agnostic helpers for named PEFT/LoRA policy adapters."""
 
     def _build_lora_module(self, module):
-        lora_adapter_path = getattr(self.model_config, "lora_adapter_path", None)
-        policy_state_adapters = tuple(getattr(self.model_config, "policy_state_adapters", ("default",)))
+        lora_settings = resolve_lora_config(self.model_config)
+        lora_adapter_path = lora_settings.adapter_path
+        policy_state_adapters = lora_settings.adapters
         extra_adapters = tuple(adapter for adapter in policy_state_adapters if adapter not in ("default", "reference"))
-        primary_adapter = policy_state_adapters[0] if policy_state_adapters else "default"
+        primary_adapter = policy_state_adapters[0]
         if lora_adapter_path is not None:
             from verl.utils.fs import copy_to_local
 
@@ -45,8 +48,8 @@ class LoRAAdapterMixin:
                     module.add_adapter(peft_config, adapter_name=adapter_name)
         else:
             lora_config = {
-                "r": self.model_config.lora_rank,
-                "lora_alpha": self.model_config.lora_alpha,
+                "r": lora_settings.rank,
+                "lora_alpha": lora_settings.alpha,
                 "init_lora_weights": self.model_config.lora_init_weights,
                 "target_modules": convert_to_regular_types(self.model_config.target_modules),
                 "target_parameters": convert_to_regular_types(self.model_config.target_parameters),
@@ -89,7 +92,8 @@ class LoRAAdapterMixin:
         is_fsdp_module = fsdp_version(self.module) in (1, 2)
         is_offload_param = getattr(self, "_is_offload_param", False)
         origin_module_device = next(self.module.parameters()).device.type
-        if is_fsdp_module and (is_offload_param or origin_module_device == "cpu"):
+        uses_cpu_offload_policy = getattr(self, "_uses_fsdp2_cpu_offload_policy", False)
+        if is_fsdp_module and (is_offload_param or origin_module_device == "cpu") and not uses_cpu_offload_policy:
             load_fsdp_model_to_gpu(self.module)
 
         ctx = fsdp_summon_full_params(self.module, writeback=True) if is_fsdp_module else nullcontext()

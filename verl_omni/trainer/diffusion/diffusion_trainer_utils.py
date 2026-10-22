@@ -58,6 +58,20 @@ def track_nonfinite_grad_streak(streak: int, grad_norm: Optional[float]) -> int:
     return streak + 1
 
 
+def skip_old_log_prob(config) -> bool:
+    """Whether the policy-gradient update reads none of the recomputed old log-probs, so the stage can be skipped."""
+    from verl_omni.trainer.diffusion.diffusion_algos import get_diffusion_loss_fn
+    from verl_omni.trainer.diffusion.rollout_correction import rollout_correction_enabled
+
+    if config.algorithm.get("trainer_type", "policy_gradient") != "policy_gradient":
+        return False
+    loss_fn = get_diffusion_loss_fn(config.actor_rollout_ref.actor.diffusion_loss.get("loss_mode", "flow_grpo"))
+    reads_log_probs = "log_probs" in loss_fn.required_model_output_keys or bool(
+        {"old_log_probs", "old_prev_sample_mean"} & set(loss_fn.required_data_keys)
+    )
+    return not reads_log_probs and not rollout_correction_enabled(config.algorithm.get("rollout_correction", None))
+
+
 def validate_distillation_config(config) -> None:
     """Cross-check the distillation switch against the losses that consume teacher outputs."""
     actor = config.actor_rollout_ref.actor
@@ -73,6 +87,20 @@ def validate_distillation_config(config) -> None:
             "A distillation loss is active but no teacher is configured; set distillation.enabled=true "
             "and distillation.teacher_models.teacher_model.model_path."
         )
+    if enabled:
+        student_guidance_scale = config.actor_rollout_ref.rollout.pipeline.get("guidance_scale") or 0.0
+        inherited_guidance_scale = config.actor_rollout_ref.model.pipeline.get("guidance_scale") or 0.0
+        for name, teacher in config.distillation.teacher_models.items():
+            teacher_guidance_scale = teacher.get("guidance_scale")
+            if teacher_guidance_scale is None:
+                teacher_guidance_scale = inherited_guidance_scale
+            if teacher_guidance_scale > 1.0 and student_guidance_scale <= 1.0:
+                raise ValueError(
+                    f"distillation.teacher_models.{name} runs with guidance_scale={teacher_guidance_scale} (its own "
+                    "value or the inherited actor_rollout_ref.model.pipeline.guidance_scale), which needs negative "
+                    "prompt embeds that the rollout only produces with "
+                    "actor_rollout_ref.rollout.pipeline.guidance_scale > 1."
+                )
     if enabled and actor.use_distill_loss and actor.distill_loss_mode != "distill_kl":
         raise NotImplementedError(
             f"The teacher runtime produces teacher_prev_sample_mean, which only distill_kl consumes, "

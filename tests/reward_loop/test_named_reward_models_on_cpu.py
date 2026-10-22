@@ -1427,14 +1427,9 @@ async def test_async_compute_rm_score_serializes_lifecycle_brackets():
 
 @pytest.mark.parametrize(
     "trainer_type, loss_mode",
-    [
-        ("direct_preference", "dpo"),
-        ("policy_gradient", "flow_grpo"),
-        ("direct_preference", "diffusion_nft"),
-        ("direct_preference", "omni_nft"),
-    ],
+    [("direct_preference", "dpo"), ("policy_gradient", "flow_grpo"), ("direct_preference", "diffusion_nft")],
 )
-def test_component_rewards_are_unavailable_before_consumer_integration(monkeypatch, trainer_type, loss_mode):
+def test_component_rewards_reject_scalar_consumers_before_worker_setup(monkeypatch, trainer_type, loss_mode):
     from verl_omni.reward_loop import reward_loop as loop_module
 
     config = _config({"quality": {"backend": "engine"}})
@@ -1450,10 +1445,38 @@ def test_component_rewards_are_unavailable_before_consumer_integration(monkeypat
         OmniRewardLoopManager(config)
 
 
-def test_component_rewards_are_unavailable_without_named_models():
+def test_component_rewards_require_named_models():
     config = _config()
     config.reward.aggregation = "preserve_components"
-    with pytest.raises(ValueError, match="preserve_components.*not supported yet"):
+    with pytest.raises(ValueError, match="requires named reward.models"):
+        OmniRewardLoopManager(config)
+
+
+def test_component_rewards_accept_registered_omninft_loss(monkeypatch):
+    from verl_omni.reward_loop import reward_loop as loop_module
+
+    config = _config({"quality": {"backend": "engine"}})
+    config.reward.aggregation = "preserve_components"
+    config.algorithm.trainer_type = "direct_preference"
+    config.actor_rollout_ref.actor.diffusion_loss.loss_mode = "omni_nft"
+    config.reward.reward_manager.name = "MultiVisualRewardManager"
+    config.reward.reward_functions = OmegaConf.create({"quality": {"path": "unused", "name": "compute_score"}})
+    monkeypatch.setattr(
+        loop_module, "MultiRewardModelManager", lambda *args, **kwargs: SimpleNamespace(models={"quality": object()})
+    )
+    initialized = []
+    monkeypatch.setattr(OmniRewardLoopManager, "_init_reward_loop_workers", lambda self: initialized.append(self))
+    manager = OmniRewardLoopManager(config)
+    assert initialized == [manager]
+    assert manager._preserve_reward_components is True
+
+
+def test_component_rewards_reject_policy_gradient_omninft_configuration():
+    config = _config({"quality": {"backend": "engine"}})
+    config.reward.aggregation = "preserve_components"
+    config.algorithm.trainer_type = "policy_gradient"
+    config.actor_rollout_ref.actor.diffusion_loss.loss_mode = "omni_nft"
+    with pytest.raises(ValueError, match="OmniNFT direct-preference trainer"):
         OmniRewardLoopManager(config)
 
 

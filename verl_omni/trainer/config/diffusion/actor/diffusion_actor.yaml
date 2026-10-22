@@ -59,6 +59,18 @@ diffusion_loss:
   # DGPO clip range on the old-policy denoising-loss ratio; 0 disables clipping
   dgpo_clip_range: 0.01
 
+  # OmniNFT video loss weight
+  video_weight: 1.0
+
+  # OmniNFT audio loss weight
+  audio_weight: 1.0
+
+  # OmniNFT video prediction-space reference MSE coefficient
+  video_ref_kl_coef: 0.0
+
+  # OmniNFT audio prediction-space reference MSE coefficient
+  audio_ref_kl_coef: 0.0
+
 # Rollout Correction config.  Fields mirror RolloutCorrectionConfig.
 # rollout_is defaults to null (off); override for IS diagnostics.
 rollout_correction:

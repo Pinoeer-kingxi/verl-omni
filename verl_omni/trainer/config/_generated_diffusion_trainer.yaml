@@ -95,6 +95,10 @@ actor_rollout_ref:
       add_kl_coefficient: true
       dgpo_beta: 100.0
       dgpo_clip_range: 0.01
+      video_weight: 1.0
+      audio_weight: 1.0
+      video_ref_kl_coef: 0.0
+      audio_ref_kl_coef: 0.0
     rollout_correction:
       _target_: verl.trainer.config.algorithm.RolloutCorrectionConfig
       bypass_mode: ${oc.select:algorithm.rollout_correction.bypass_mode,false}
@@ -273,6 +277,7 @@ actor_rollout_ref:
         height: ${oc.select:actor_rollout_ref.rollout.pipeline.height,512}
         width: ${oc.select:actor_rollout_ref.rollout.pipeline.width,512}
         num_inference_steps: 50
+        requested_outputs: ${oc.select:actor_rollout_ref.rollout.pipeline.requested_outputs,null}
         true_cfg_scale: ${oc.select:actor_rollout_ref.rollout.pipeline.true_cfg_scale,1.0}
         max_sequence_length: ${oc.select:actor_rollout_ref.rollout.pipeline.max_sequence_length,512}
         guidance_scale: ${oc.select:actor_rollout_ref.rollout.pipeline.guidance_scale,null}
@@ -305,6 +310,7 @@ actor_rollout_ref:
       height: 512
       width: 512
       num_inference_steps: 10
+      requested_outputs: null
       true_cfg_scale: 1.0
       max_sequence_length: 512
       guidance_scale: null
@@ -386,6 +392,7 @@ actor_rollout_ref:
       height: ${oc.select:actor_rollout_ref.rollout.pipeline.height,512}
       width: ${oc.select:actor_rollout_ref.rollout.pipeline.width,512}
       num_inference_steps: ${oc.select:actor_rollout_ref.rollout.pipeline.num_inference_steps,10}
+      requested_outputs: ${oc.select:actor_rollout_ref.rollout.pipeline.requested_outputs,null}
       true_cfg_scale: ${oc.select:actor_rollout_ref.rollout.pipeline.true_cfg_scale,1.0}
       max_sequence_length: ${oc.select:actor_rollout_ref.rollout.pipeline.max_sequence_length,512}
       guidance_scale: ${oc.select:actor_rollout_ref.rollout.pipeline.guidance_scale,null}
@@ -567,6 +574,7 @@ distillation:
       key: null
       model_path: null
       world_size: 0
+      guidance_scale: null
   teacher_key: data_source
   scheduler: inline
 dmd:

@@ -241,11 +241,11 @@ fatal.
 
 ## Component rewards and consumer support
 
-`reward.aggregation` defaults to `weighted_sum`. This reward-only change prepares
-component assembly but rejects `preserve_components` at initialization, before
-reward workers start. No current trainer supports component rewards; the
-companion OmniNFT integration (#664) will enable the mode alongside its consumer
-and compatibility checks. Setting an OmniNFT loss name alone does not enable it.
+`reward.aggregation` defaults to `weighted_sum`. Component mode requires
+`algorithm.trainer_type=direct_preference` and the registered `omni_nft` loss.
+The reward manager checks both at initialization, before reward workers start.
+The OmniNFT loss consumes the named components and applies modality routing.
+Online DPO, FlowGRPO, and ordinary DiffusionNFT do not support this layout.
 
 For a supporting consumer, component mode returns `rm_scores` with shape `[B, K]`.
 Columns follow the sorted reward-function names in `meta_info["reward_names"]`.

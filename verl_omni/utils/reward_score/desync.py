@@ -26,7 +26,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-from .reward_utils import audio_info_from_batch, get_audio, load_torch_state_dict, resample_audio
+from .reward_utils import audio_info_from_batch, get_audio, load_torch_state_dict, resample_audio, video_reward_tensor
 
 _TARGET_VIDEO_FPS = 25.0
 _TARGET_AUDIO_RATE = 16_000
@@ -228,6 +228,7 @@ async def compute_score(
     fps = float(fps)
     if not math.isfinite(fps) or fps <= 0:
         raise ValueError("DeSync fps must be finite and positive.")
+    solution_image = video_reward_tensor(solution_image, extra_info, fps)
     if (
         not isinstance(solution_image, torch.Tensor)
         or solution_image.ndim != 4

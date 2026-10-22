@@ -20,6 +20,7 @@ from typing import Any, Callable, Optional
 import torch
 from diffusers import ModelMixin, SchedulerMixin
 from tensordict import TensorDict
+from verl.utils import tensordict_utils as tu
 
 from verl_omni.workers.config import DiffusionModelConfig
 
@@ -90,6 +91,66 @@ class DiffusionModelBase(ABC):
                 f"algorithm={algorithm!r}). Registered: {registered}. "
                 f"Set ``external_lib`` in DiffusionModelConfig to load your implementation."
             ) from None
+
+    @staticmethod
+    def _flow_time(micro_batch, step, scheduler):
+        timestep = micro_batch["train_timesteps"][:, step]
+        scale = getattr(scheduler.config, "num_train_timesteps", None)
+        if scale is None:
+            raise ValueError(
+                "Converting `train_timesteps` to flow time requires "
+                f"scheduler.config.num_train_timesteps, but {type(scheduler).__name__} does not define it."
+            )
+        tu.assign_non_tensor(micro_batch, num_train_timesteps=int(scale))
+        return timestep, timestep.float() / float(scale)
+
+    @staticmethod
+    def _noise_latents(micro_batch, clean_key, noise_key, step, time):
+        x0 = micro_batch[clean_key]
+        t = time.view(-1, *([1] * (x0.ndim - 1)))
+        noise = micro_batch.get(noise_key, None)
+        if noise is None:
+            noise = torch.randn_like(x0.float())
+        elif noise.ndim == x0.ndim + 1:
+            noise = noise[:, step]
+        return {"x0": x0, "xt": (1.0 - t) * x0 + t * noise, "t_expanded": t}
+
+    @classmethod
+    def validate_engine_config(cls, engine_config) -> None:
+        """Validate adapter requirements before NFT engine initialization."""
+        return
+
+    @classmethod
+    def configure_gradient_checkpointing(cls, module, engine_config) -> None:
+        """Enable standard checkpointing unless the NFT adapter overrides it."""
+        module.enable_gradient_checkpointing()
+
+    @classmethod
+    def prepare_training_inputs(
+        cls, micro_batch: TensorDict, step: int, scheduler
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+        """Prepare the default NFT noising context using the scheduler's timestep scale."""
+        timestep, time = cls._flow_time(micro_batch, step, scheduler)
+        context = cls._noise_latents(micro_batch, "latents_clean", "forward_noise", step, time)
+        return context["xt"], timestep, context
+
+    @staticmethod
+    def prepare_model_outputs(predictions: dict, loss_context: dict) -> dict:
+        """Combine policy predictions with algorithm-owned loss context."""
+        return {**loss_context, **predictions}
+
+    @staticmethod
+    def prepare_loss_inputs(micro_batch: TensorDict, step: int) -> dict:
+        """Slice per-timestep fields and retain per-sample group metadata."""
+        inputs = {
+            key: micro_batch[key][:, step]
+            for key in ("reward_prob", "advantages")
+            if micro_batch.get(key, None) is not None
+        }
+        inputs.update(
+            {key: micro_batch[key] for key in ("group_index", "group_size") if micro_batch.get(key, None) is not None}
+        )
+        return inputs
 
     @classmethod
     def build_module(cls, model_config: DiffusionModelConfig, torch_dtype: torch.dtype) -> Optional[torch.nn.Module]:

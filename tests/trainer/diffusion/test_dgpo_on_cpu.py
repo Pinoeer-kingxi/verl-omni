@@ -442,7 +442,13 @@ def test_actor_update_keeps_dgpo_groups_unshuffled(
 
 @pytest.mark.parametrize(
     "loss_mode,uses_old_adapter,accepted",
-    [("dgpo", None, True), ("diffusion_nft", None, True), ("dpo", None, False), ("dpo", True, True)],
+    [
+        ("dgpo", None, True),
+        ("diffusion_nft", None, True),
+        ("omni_nft", None, True),
+        ("dpo", None, False),
+        ("dpo", True, True),
+    ],
 )
 @pytest.mark.parametrize("trainer_version", ["v0", "v1"])
 def test_old_adapter_requires_a_loss_that_uses_it(loss_mode, uses_old_adapter, accepted, trainer_version, monkeypatch):

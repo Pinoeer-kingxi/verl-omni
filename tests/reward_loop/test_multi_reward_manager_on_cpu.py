@@ -26,6 +26,7 @@ from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf
 from verl import DataProto
 
+from verl_omni.reward_loop.reward_manager.media import _reward_extra_info
 from verl_omni.reward_loop.reward_manager.multi import MultiRewardManager, MultiVisualRewardManager, _filter_kwargs
 from verl_omni.reward_loop.reward_manager.visual import VisualRewardManager
 
@@ -51,6 +52,14 @@ def reward_dict_result(data_source, ground_truth):
 def reward_raises(data_source, solution_image, ground_truth, extra_info):
     """Always raises to test error handling."""
     raise ValueError("intentional failure")
+
+
+def reward_requires_audio(data_source, solution_image, ground_truth, extra_info):
+    """Exercise a real artifact selection failure, not an optional network failure."""
+    from verl_omni.utils.reward_score.clap import _get_audio
+
+    _get_audio(extra_info)
+    return {"score": 1.0}
 
 
 async def reward_async(data_source, solution_image, ground_truth, extra_info):
@@ -151,6 +160,7 @@ def _make_single_data(data_source: str = "test_source") -> DataProto:
         non_tensors={
             "data_source": [data_source],
             "reward_model": [{"ground_truth": "hello"}],
+            "media_kind": ["image"],
             "extra_info": [{}],
         },
     )
@@ -160,6 +170,16 @@ def _build_manager(reward_functions: dict) -> MultiVisualRewardManager:
     config = _make_config(reward_functions)
     tokenizer = MagicMock()
     return MultiVisualRewardManager(config, tokenizer, compute_score=None)
+
+
+def test_optional_reward_does_not_swallow_artifact_contract_errors():
+    from verl_omni.pipelines.rollout_media import ArtifactContractError
+
+    manager = _build_manager(
+        {"audio": {"path": DUMMY_REWARDS_PATH, "name": "reward_requires_audio", "required": False}}
+    )
+    with pytest.raises(ArtifactContractError, match="audio.*absent"):
+        manager.loop.run_until_complete(manager.run_single(_make_single_data()))
 
 
 def _build_visual_latent_manager() -> VisualRewardManager:
@@ -279,12 +299,14 @@ class TestMultiRewardManagerRunSingle:
             expected_sampling["seed"] = 42
         if explicit_sampling is not None:
             expected_sampling = explicit_sampling
+        item = data[0]
+        baseline_extra_info = _reward_extra_info(item)
         previous = manager.loop.run_until_complete(
             genrm_ocr.compute_score_ocr(
                 data_source="test_source",
-                solution_image=data[0].batch["responses"],
+                solution_image=item.batch["responses"],
                 ground_truth="hello",
-                extra_info={},
+                extra_info=baseline_extra_info,
                 reward_router_address="engine-router",
                 model_name="ocr-model",
                 sampling_params=expected_sampling,
@@ -338,7 +360,7 @@ class TestMultiRewardManagerRunSingle:
                 data_source="test",
                 solution_image=item.batch["responses"],
                 ground_truth="test",
-                extra_info={},
+                extra_info=_reward_extra_info(item),
                 reward_router_address="engine-router",
                 model_name="ocr-model",
             )
@@ -662,6 +684,7 @@ class TestMultiRewardManagerRunSingle:
             non_tensors={
                 "data_source": ["jpeg_compressibility"],
                 "reward_model": [{"ground_truth": "hello"}],
+                "media_kind": ["image"],
                 "extra_info": [{}],
             },
         )

@@ -66,7 +66,10 @@ def _get_batching_state() -> _BatchingState:
 
 
 def _get_audio(extra_info: dict) -> tuple[torch.Tensor, int]:
-    """Preserve legacy CLAP rate/layout defaults while sharing audio validation."""
+    if "media_artifacts" not in extra_info and extra_info.get("audio") is None:
+        from verl_omni.pipelines.rollout_media import ArtifactContractError
+
+        raise ArtifactContractError("CLAP decoded audio is absent; provide named or legacy decoded audio")
     info = dict(extra_info)
     info.setdefault("audio_sample_rate", _CLAP_SAMPLE_RATE)
     info.setdefault("audio_layout", "CT")
@@ -226,7 +229,8 @@ async def compute_score(
 
     Defaults preserve the existing cached, batched cosine scorer. A supplied
     reward_model owns inference and lifecycle. A single-sample batch takes
-    precedence over extra_info for decoded audio and its sample rate.
+    precedence over legacy extra_info audio and its sample rate. Named audio
+    artifacts remain authoritative and must satisfy the media contract.
     prompt_key selects reward_inputs.text[prompt_key] from batch;
     without it, ground_truth supplies the text. Apply scale/offset to cosine,
     then optional lower/upper bounds. No recipe or checkpoint is hardcoded.

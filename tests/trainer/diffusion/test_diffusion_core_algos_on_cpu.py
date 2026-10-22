@@ -18,8 +18,83 @@ import os
 import numpy as np
 import pytest
 import torch
+from omegaconf import OmegaConf
 
 from verl_omni.trainer.diffusion import diffusion_algos
+from verl_omni.workers.config.diffusion.actor import DiffusionActorConfig, DiffusionLossConfig
+
+
+@pytest.mark.parametrize("missing_modality", ["video", "audio"])
+@pytest.mark.parametrize("explicit_null", [False, True])
+def test_omni_nft_rejects_missing_routing_weight(missing_modality, explicit_null):
+    weights = {"video": 1.0, "audio": 1.0}
+    if explicit_null:
+        weights[missing_modality] = None
+    else:
+        del weights[missing_modality]
+    with pytest.raises(ValueError, match=rf"Reward 'quality' must define routing_weights\.{missing_modality}"):
+        diffusion_algos.OmniNFTLoss._build_reward_routing_matrix(
+            reward_names=["quality"],
+            reward_functions={"quality": {"routing_weights": weights}},
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+
+
+@pytest.mark.parametrize("overrides", [{}, {"video_ref_kl_coef": 1e-4, "audio_ref_kl_coef": 1e-4}])
+def test_omni_nft_loss_with_declared_config(overrides):
+    config = DiffusionActorConfig(
+        strategy="fsdp2", rollout_n=1, diffusion_loss=DiffusionLossConfig(loss_mode="omni_nft", **overrides)
+    )
+    inputs = {}
+    predictions = []
+    for modality, length in (("video", 3), ("audio", 2)):
+        prediction = torch.full((2, length, 4), 0.2, requires_grad=True)
+        predictions.append(prediction)
+        inputs.update(
+            {
+                f"{modality}_forward_prediction": prediction,
+                f"{modality}_old_prediction": torch.zeros_like(prediction),
+                f"{modality}_ref_forward_prediction": torch.zeros_like(prediction),
+                f"{modality}_x0": torch.zeros_like(prediction),
+                f"{modality}_xt": torch.ones_like(prediction),
+                f"{modality}_t_expanded": torch.full((2, 1, 1), 0.5),
+                f"{modality}_reward_prob": torch.tensor([0.7, 0.8]),
+            }
+        )
+    loss, metrics = diffusion_algos.OmniNFTLoss.compute_loss(config=config, **inputs)
+    expected = (
+        sum(
+            metrics[f"actor/{modality}/policy_loss"]
+            + overrides.get(f"{modality}_ref_kl_coef", 0.0) * metrics[f"actor/{modality}/ref_kl_loss"]
+            for modality in ("video", "audio")
+        )
+        / 2
+    )
+    assert loss.item() == pytest.approx(expected)
+    loss.backward()
+    for prediction in predictions:
+        assert prediction.grad is not None
+        assert torch.isfinite(prediction.grad).all()
+        assert prediction.grad.abs().sum() > 0
+
+
+@pytest.mark.parametrize("actor_config", [{}, {"enable_timestep_staging": False}, {"enable_timestep_staging": True}])
+def test_omni_nft_trainer_rejects_timestep_staging(actor_config):
+    config = OmegaConf.create({"algorithm": {}, "actor_rollout_ref": {"actor": actor_config}})
+    loss = diffusion_algos.get_diffusion_loss_fn("omni_nft")
+    if actor_config.get("enable_timestep_staging", False):
+        with pytest.raises(ValueError, match="actor_rollout_ref.actor.enable_timestep_staging=False"):
+            loss.validate_trainer_config(config)
+    else:
+        loss.validate_trainer_config(config)
+
+
+@pytest.mark.parametrize("key,value", [("train_timestep_range", [0, 2]), ("train_timestep_count", 2)])
+def test_omni_nft_retains_base_trainer_validation(key, value):
+    config = OmegaConf.create({"algorithm": {key: value}, "actor_rollout_ref": {"actor": {}}})
+    with pytest.raises(ValueError, match=f"algorithm.{key} is only used by the dgpo loss"):
+        diffusion_algos.get_diffusion_loss_fn("omni_nft").validate_trainer_config(config)
 
 
 @pytest.mark.parametrize("norm_adv_by_std_in_grpo", [True, False])
@@ -431,6 +506,53 @@ def test_prepare_diffusion_nft_actor_batch() -> None:
     assert result.batch["returns"].shape == (B, num_train)
     assert result.batch["sample_level_rewards"].shape == (B, num_train)
     assert ((result.batch["reward_prob"] >= 0) & (result.batch["reward_prob"] <= 1)).all()
+
+
+def test_prepare_omni_nft_actor_batch_restores_single_component_axis() -> None:
+    from types import SimpleNamespace
+
+    from verl import DataProto
+
+    batch_size, num_timesteps = 4, 6
+    scores = torch.tensor([[1.0], [0.0], [0.2], [0.8]])
+    batch = DataProto.from_dict(
+        tensors={
+            "video_latents_clean": torch.randn(batch_size, 4, 2),
+            "audio_latents_clean": torch.randn(batch_size, 4, 2),
+            "train_timesteps": torch.randint(0, 1000, (batch_size, num_timesteps)),
+            "rm_scores": scores,
+        },
+        non_tensors={"uid": np.array(["p0", "p0", "p1", "p1"], dtype=object)},
+        meta_info={"reward_names": ["quality"]},
+    )
+    config = SimpleNamespace(
+        algorithm=SimpleNamespace(
+            norm_adv_by_std_in_grpo=True,
+            global_std=True,
+            adv_mode="continuous",
+            timestep_fraction=0.5,
+        ),
+        actor_rollout_ref=SimpleNamespace(
+            actor=SimpleNamespace(
+                diffusion_loss=SimpleNamespace(adv_clip_max=5.0),
+                data_loader_seed=42,
+            )
+        ),
+        reward=SimpleNamespace(
+            reward_functions={
+                "quality": {"routing_weights": {"video": 1.0, "audio": 1.0}},
+            }
+        ),
+    )
+
+    result = diffusion_algos.OmniNFTLoss.prepare_actor_batch(batch, scores.squeeze(-1), config)
+
+    selected_timesteps = max(1, int(num_timesteps * config.algorithm.timestep_fraction))
+    centered = torch.tensor([[0.5], [-0.5], [-0.3], [0.3]])
+    expected_prob = 0.5 + 0.5 * centered / (scores.std(correction=0) + 1e-4) / 5.0
+    torch.testing.assert_close(result.batch["reward_prob"], expected_prob[:, None, :].expand(-1, selected_timesteps, 2))
+    assert result.batch["reward_prob"].shape == (batch_size, selected_timesteps, 2)
+    assert result.batch["sample_level_rewards"].shape == (batch_size, 1)
 
 
 def test_prepare_online_dpo_actor_batch() -> None:

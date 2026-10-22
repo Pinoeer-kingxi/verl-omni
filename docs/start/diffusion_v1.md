@@ -1,6 +1,6 @@
 # Diffusion V1 training
 
-Last updated: 09/28/2026
+Last updated: 10/15/2026
 
 This guide runs the diffusion V1 trainer in synchronous or separate-asynchronous
 mode using the provided Stable Diffusion 3.5 Medium FlowGRPO OCR recipes.
@@ -176,9 +176,10 @@ The backend is a verl-omni subclass of verl's `DeltaShardedCheckpointEngine`
 (verl gates the raw `delta_sharded` name to sglang rollouts, so
 `omni_delta_sharded` resolves through verl's `CheckpointEngineRegistry`). The
 subclass re-declares the wire as the stock `named_tensors` bucketed stream and
-flattens each flush's sentinel tensors into it, so verl's unmodified
-`CheckpointEngineWorker` and vLLM `ServerAdapter` drive the whole sync; the
-vllm-omni worker extension routes the stream by sniffing the first bucket and
+flattens each flush's sentinel tensors into it. verl's `CheckpointEngineWorker`
+and the inherited vLLM `ServerAdapter` weight sender drive the sync; the omni
+adapter requests checked replies for IPC updates. The vllm-omni worker
+extension routes the stream by sniffing the first bucket and
 applies flushes in place through verl's delta loader.
 
 `omni_delta_sharded` is gated: it requires `separate_async` mode and full-weight

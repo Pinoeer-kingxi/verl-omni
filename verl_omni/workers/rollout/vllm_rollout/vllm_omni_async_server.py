@@ -59,6 +59,18 @@ _LORA_REQUEST_CACHE_MISS = object()
 _ENGINE_ARGS_DEFAULTS: dict | None = None
 
 
+def _validate_collective_rpc_reply(method: str, result: Any) -> None:
+    """Reject worker ``error``, ``todo``, and ``supported=False`` replies; allow ``None``."""
+    if isinstance(result, list | tuple):
+        if not result:
+            raise RuntimeError(f"{method} failed: empty worker results")
+        for item in result:
+            _validate_collective_rpc_reply(method, item)
+    elif isinstance(result, dict):
+        if result.get("error") or result.get("todo") or result.get("supported") is False:
+            raise RuntimeError(f"{method} failed: {result}")
+
+
 def _is_defaulted_value(key: str, value: Any, default: Any) -> bool:
     """Return True if *value* matches the upstream default for *key*."""
     if value == default:
@@ -95,7 +107,8 @@ def _drop_defaulted_engine_args(engine_args: dict) -> dict:
     """Keep only explicitly-set engine arguments, dropping upstream defaults."""
     global _ENGINE_ARGS_DEFAULTS
     if _ENGINE_ARGS_DEFAULTS is None:
-        defaults = asdict(OmniEngineArgs(model=""))
+        model = engine_args.get("model", "")
+        defaults = asdict(OmniEngineArgs(model=model))
         defaults.update(asdict(OrchestratorArgs()))
         _ENGINE_ARGS_DEFAULTS = defaults
     defaults = _ENGINE_ARGS_DEFAULTS
@@ -286,15 +299,50 @@ class vLLMOmniHttpServer(vLLMHttpServer):
         timeout: float | None = None,
         args: tuple = (),
         kwargs: dict[str, Any] | None = None,
+        *,
+        require_ack: bool = False,
     ):
         """Dispatch a shared RPC to the stages selected by the active strategy."""
-        await self.engine.collective_rpc(
+        stage_ids = self._generate_strategy.collective_rpc_stage_ids(method)
+        if require_ack:
+            return await self._collective_rpc_with_ack(method, timeout, args, kwargs, stage_ids)
+        return await self.engine.collective_rpc(
             method=method,
             timeout=timeout,
             args=args,
             kwargs=kwargs,
-            stage_ids=self._generate_strategy.collective_rpc_stage_ids(method),
+            stage_ids=stage_ids,
         )
+
+    async def _collective_rpc_with_ack(
+        self, method: Any, timeout: float | None, args: tuple, kwargs: dict[str, Any] | None, stage_ids: Any
+    ) -> list[Any]:
+        """Validate one stage at a time because the pinned reply omits stage IDs."""
+        num_stages = getattr(self.engine, "num_stages", None)
+        if type(num_stages) is not int or num_stages <= 0:
+            raise RuntimeError(f"{method} failed: unknown stage topology")
+        if stage_ids is None:
+            stage_ids = list(range(num_stages))
+        if not isinstance(stage_ids, list | tuple) or not stage_ids:
+            raise RuntimeError(f"{method} failed: no selected stages")
+        if any(type(stage_id) is not int or not 0 <= stage_id < num_stages for stage_id in stage_ids):
+            raise RuntimeError(f"{method} failed: unknown selected stage")
+
+        # The pinned flattened reply has no stage IDs. Check each stage separately.
+        replies: list[Any] = []
+        for stage_id in dict.fromkeys(stage_ids):
+            results = await self.engine.collective_rpc(
+                method=method,
+                timeout=timeout,
+                args=args,
+                kwargs=kwargs,
+                stage_ids=[stage_id],
+            )
+            if not isinstance(results, list | tuple) or not results:
+                raise RuntimeError(f"{method} failed: missing replica results for stage {stage_id}")
+            _validate_collective_rpc_reply(method, results)
+            replies.extend(results)
+        return replies
 
     # -----------------------------------------------------------------------
     # wake_up hook: full wake must include kv_cache
@@ -579,6 +627,24 @@ class vLLMOmniHttpServer(vLLMHttpServer):
 
 class vLLMOmniServerAdapter(ServerAdapter):
     """Reuse verl's transport with SP-aware replica and IPC rank mapping."""
+
+    async def _execute_method(
+        self,
+        method: str,
+        non_block: bool = False,
+        timeout: Optional[float] = None,
+        args: tuple = (),
+        kwargs: Optional[dict] = None,
+    ):
+        """Require checked replies for IPC weight updates through the inherited sender."""
+        if method != "update_weights_from_ipc":
+            return await super()._execute_method(method, non_block=non_block, timeout=timeout, args=args, kwargs=kwargs)
+        if not self._ensure_server_handle():
+            return None
+        future = self.server_handle.collective_rpc.remote(
+            method, timeout=timeout, args=args, kwargs=kwargs, require_ack=True
+        )
+        return future if non_block else await future
 
     def __init__(self, config, model_config, device_mesh, replica_rank: int = -1):
         super().__init__(config, model_config, device_mesh, replica_rank=replica_rank)

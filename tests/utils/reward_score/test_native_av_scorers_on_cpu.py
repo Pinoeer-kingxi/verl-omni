@@ -24,6 +24,8 @@ from unittest.mock import AsyncMock
 import pytest
 import torch
 
+from verl_omni.pipelines.rollout_media import ArtifactContractError, MediaArtifact, MediaSpec
+
 # Load only scorers, avoiding top-level engine/rollout auto-registration on CPU.
 _PACKAGE = "native_av_scorers_under_test"
 package = ModuleType(_PACKAGE)
@@ -56,6 +58,64 @@ def _batch(*, audio=None, sample_rate=48000, video=None, fps=24.0):
 
 def _video(values):
     return torch.stack([torch.full((3, 2, 2), value, dtype=torch.uint8) for value in values])
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf")])
+def test_named_audio_rejects_nonfinite_samples(value):
+    with pytest.raises(ArtifactContractError, match="finite"):
+        reward_utils.get_audio(
+            {
+                "media_artifacts": {
+                    "audio": MediaArtifact(
+                        MediaSpec("audio", "decoded", "CT", sample_rate=48000), torch.full((1, 16), value)
+                    ),
+                }
+            }
+        )
+
+
+@pytest.mark.asyncio
+async def test_clap_native_named_audio_is_authoritative():
+    model = SimpleNamespace(
+        infer=AsyncMock(
+            return_value={
+                "audio_embeddings": torch.tensor([[1.0, 0.0]]),
+                "text_embeddings": torch.tensor([[1.0, 0.0]]),
+            }
+        )
+    )
+    info = {
+        "media_artifacts": {
+            "audio": MediaArtifact(MediaSpec("audio", "decoded", "CT", sample_rate=48000), torch.ones(2, 16)),
+        },
+    }
+    result = await clap.compute_score(
+        "test", None, "prompt", info, reward_model=model, batch=_batch(audio=torch.zeros(2, 16))
+    )
+    assert result == {"score": pytest.approx(1.0), "source_sample_rate": 48000}
+    assert model.infer.await_args.args[0][0].tolist() == pytest.approx([1.0] * 16)
+    info["media_artifacts"] = {}
+    model.infer.reset_mock()
+    with pytest.raises(ArtifactContractError, match="absent"):
+        await clap.compute_score(
+            "test", None, "prompt", info, reward_model=model, batch=_batch(audio=torch.zeros(2, 16))
+        )
+    model.infer.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_hpsv3_native_missing_preview_does_not_score_latents():
+    model = SimpleNamespace(infer=AsyncMock())
+    with pytest.raises(ArtifactContractError, match="preview"):
+        await hpsv3_reward.compute_score_hpsv3(
+            "test",
+            torch.zeros(4, 5, 2, 2),
+            "prompt",
+            {"media_artifacts": {}, "preview_artifact": "video"},
+            reward_model=model,
+            num_frames=3,
+        )
+    model.infer.assert_not_awaited()
 
 
 def test_audio_batch_overrides_extra_info_for_all_scorers():
@@ -163,9 +223,14 @@ async def test_hpsv3_native_frame_sampling_microbatches_and_top_scores():
     model = SimpleNamespace(infer=AsyncMock(side_effect=infer))
     result = await hpsv3_reward.compute_score_hpsv3(
         "test",
-        _video([1, 2, 3, 4, 5]),
+        torch.zeros(4, 5, 2, 2),
         "fallback",
-        {},
+        {
+            "media_artifacts": {
+                "video": MediaArtifact(MediaSpec("video", "decoded", "TCHW", fps=24), _video([1, 2, 3, 4, 5])),
+            },
+            "preview_artifact": "video",
+        },
         reward_model=model,
         batch=_batch(),
         prompt_key="video",
@@ -185,12 +250,14 @@ def test_hpsv3_frame_aggregation(fraction, cap, expected):
 
 def test_hpsv3_default_and_uniform_frame_selection():
     video = _video(range(9))
-    assert [im.getpixel((0, 0))[0] for im in hpsv3_reward._select_reward_frames(video, {}, None)] == [0, 4, 8]
-    assert [im.getpixel((0, 0))[0] for im in hpsv3_reward._select_reward_frames(video, {}, 3)] == [0, 4, 8]
+    info = {"media_kind": "video", "fps": 24}
+    assert [im.getpixel((0, 0))[0] for im in hpsv3_reward._select_reward_frames(video, info, None)] == [0, 4, 8]
+    assert [im.getpixel((0, 0))[0] for im in hpsv3_reward._select_reward_frames(video, info, 3)] == [0, 4, 8]
 
 
 @pytest.mark.asyncio
-async def test_audiobox_native_duration_weighted_windows():
+@pytest.mark.parametrize("named", [False, True])
+async def test_audiobox_native_duration_weighted_windows(named):
     async def infer(windows, masks):
         assert windows.shape == (2, 1, 160000)
         assert masks.sum(dim=(1, 2)).tolist() == [160000, 80000]
@@ -201,6 +268,13 @@ async def test_audiobox_native_duration_weighted_windows():
 
     result = await audiobox.compute_score(
         reward_model=SimpleNamespace(infer=AsyncMock(side_effect=infer)),
+        extra_info={
+            "media_artifacts": {
+                "audio": MediaArtifact(MediaSpec("audio", "decoded", "CT", sample_rate=16000), torch.ones(1, 240000)),
+            },
+        }
+        if named
+        else {},
         batch=_batch(audio=torch.ones(1, 240000), sample_rate=16000),
     )
     # De-normalized windows score 3 and 7; CE+CU-PC+PQ gives 2x each.
@@ -217,10 +291,20 @@ def test_audiobox_windows_preserve_tail_and_mask_padding():
 
 
 @pytest.mark.asyncio
-async def test_videoalign_native_sampling_prompt_and_calibration():
+@pytest.mark.parametrize("named", [False, True])
+async def test_videoalign_native_sampling_prompt_and_calibration(named):
     model = SimpleNamespace(infer=AsyncMock(return_value=torch.tensor([[3.0, 5.0, 7.0]])))
     result = await videoalign.compute_score(
         reward_model=model,
+        solution_image=torch.zeros(4, 8, 2, 2) if named else None,
+        extra_info={
+            "media_artifacts": {
+                "video": MediaArtifact(MediaSpec("video", "decoded", "TCHW", fps=48), _video(range(8))),
+            },
+            "preview_artifact": "video",
+        }
+        if named
+        else {},
         batch=_batch(video=_video(range(8)), fps=48),
         fps=48,
         prompt_key="video",
@@ -248,7 +332,8 @@ def test_desync_temporal_sampling_uses_frame_centers():
 
 
 @pytest.mark.asyncio
-async def test_desync_native_preparation_and_offset_score():
+@pytest.mark.parametrize("named", [False, True])
+async def test_desync_native_preparation_and_offset_score(named):
     async def infer(video, audio):
         assert video.shape == (1, 200, 3, 224, 224)
         assert audio.shape == (1, 128000)
@@ -261,6 +346,16 @@ async def test_desync_native_preparation_and_offset_score():
 
     result = await desync.compute_score(
         reward_model=SimpleNamespace(infer=AsyncMock(side_effect=infer)),
+        solution_image=torch.zeros(4, 2, 2, 2) if named else None,
+        extra_info={
+            "media_artifacts": {
+                "video": MediaArtifact(MediaSpec("video", "decoded", "TCHW", fps=25), _video([0, 255])),
+                "audio": MediaArtifact(MediaSpec("audio", "decoded", "CT", sample_rate=16000), torch.ones(1, 1600)),
+            },
+            "preview_artifact": "video",
+        }
+        if named
+        else {},
         batch=_batch(video=_video([0, 255]), audio=torch.ones(1, 1600), sample_rate=16000, fps=25),
         fps=25,
     )

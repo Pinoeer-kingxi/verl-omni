@@ -141,9 +141,14 @@ class OmniRewardLoopManager(RewardLoopManager):
         self._score_lock = asyncio.Lock()
         self._preserve_reward_components = config.reward.get("aggregation") == "preserve_components"
         if self._preserve_reward_components:
-            raise ValueError(
-                "reward.aggregation=preserve_components is not supported yet; use reward.aggregation=weighted_sum."
-            )
+            if not has_reward_models(config):
+                raise ValueError("preserve_components requires named reward.models.")
+            loss_mode = config.actor_rollout_ref.actor.diffusion_loss.loss_mode
+            if config.algorithm.get("trainer_type") != "direct_preference" or loss_mode != "omni_nft":
+                raise ValueError(
+                    "reward.aggregation=preserve_components requires the OmniNFT direct-preference trainer; "
+                    "use reward.aggregation=weighted_sum for this trainer."
+                )
         self.accelerator_resource_pool = accelerator_resource_pool
         named_reward_manager_cls = None
         if has_reward_models(config):

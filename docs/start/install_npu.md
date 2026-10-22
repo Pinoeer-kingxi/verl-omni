@@ -1,6 +1,6 @@
 # Installation (NPU)
 
-Last updated: 09/24/2026
+Last updated: 10/18/2026
 
 For NVIDIA GPU, see the {doc}`GPU installation guide <install>`. For AMD GPU, see the {doc}`ROCm installation guide <install_rocm>`.
 
@@ -10,6 +10,8 @@ For NVIDIA GPU, see the {doc}`GPU installation guide <install>`. For AMD GPU, se
 * **CANN**: Version == 9.1.0
 
 ## Install
+
+Supported devices: Ascend A2, A3, and A5.
 
 ```bash
 git clone https://github.com/verl-project/verl-omni.git
@@ -23,30 +25,61 @@ uv venv --python 3.12 --seed
 source .venv/bin/activate
 ```
 
-2. Install the platform backend
+2. Install PyTorch
+
+Install the CPU build first; otherwise later steps pull the CUDA build of `torch` from PyPI.
 
 ```bash
-uv pip install vllm==0.30.0
-uv pip install "vllm-ascend @ git+https://github.com/vllm-project/vllm-ascend.git@$(cat .github/vllm_ascend_pin.txt)"
+uv pip install --force-reinstall \
+    torch==2.10.0+cpu torchvision==0.25.0+cpu torchaudio==2.10.0+cpu \
+    --extra-index-url https://download.pytorch.org/whl/cpu/ \
+    --index-strategy unsafe-best-match
+uv pip install --force-reinstall torch-npu==2.10.0.post4 \
+    --extra-index-url https://mirrors.huaweicloud.com/ascend/repos/pypi \
+    --extra-index-url https://download.pytorch.org/whl/cpu/ \
+    --index-strategy unsafe-best-match
 ```
 
-3. Install vLLM-Omni and VeRL-Omni
+3. Install vLLM and vLLM-Ascend
+
+Use `ASCEND_HOME_PATH` to select a custom CANN toolkit installation; otherwise,
+the commands use the `latest` symlink. Load ATB from its own installation
+directory rather than deriving its location from the toolkit path.
 
 ```bash
-uv pip install "vllm-omni @ git+https://github.com/vllm-project/vllm-omni.git@$(cat .github/vllm_omni_pin.txt)"
+source "${ASCEND_HOME_PATH:-/usr/local/Ascend/ascend-toolkit/latest}/set_env.sh"
+source /usr/local/Ascend/nnal/atb/set_env.sh
+
+cd ..
+git clone --depth 1 -b v0.30.0 https://github.com/vllm-project/vllm.git
+cd vllm
+VLLM_TARGET_DEVICE=empty uv pip install -e ".[audio]"
+uv pip uninstall -y triton || true
+cd ..
+
+# Clone instead of `git+https`: that path is under ~/.cache, which CANN's linker skips.
+git clone https://github.com/vllm-project/vllm-ascend.git vllm-ascend
+cd vllm-ascend
+git checkout $(tr -d '[:space:]' < ../verl-omni/.github/vllm_ascend_pin.txt)
+git submodule update --init --recursive
+uv pip install -e . \
+    --extra-index-url https://mirrors.huaweicloud.com/ascend/repos/pypi \
+    --extra-index-url https://download.pytorch.org/whl/cpu/ \
+    --index-strategy unsafe-best-match
+cd ..
+uv pip install --reinstall --no-deps triton-ascend==3.2.2 \
+    --extra-index-url https://mirrors.huaweicloud.com/ascend/repos/pypi
+cd verl-omni
+```
+
+4. Install vLLM-Omni and VeRL-Omni
+
+```bash
+VLLM_OMNI_TARGET_DEVICE=npu \
+    uv pip install "vllm-omni @ git+https://github.com/vllm-project/vllm-omni.git@$(cat .github/vllm_omni_pin.txt)"
 uv pip install -e .
+uv pip install --upgrade onnxruntime
 ```
-
-This installs `vllm-omni` and `verl-omni` with its core dependencies.
-
-> **Ascend PyTorch version alignment:** VeRL-Omni does not require every NPU
-> environment to use one fixed `torch` version such as 2.10.0. Choose a
-> mutually compatible `torch` / `torch-npu` pair for the installed CANN and
-> vLLM-Ascend versions, and pin that pair before installing the engine and
-> training stack. Packages such as `vllm`, `vllm-ascend`, `vllm-omni`, and
-> `verl` may resolve different PyTorch versions while they are installed.
-> Re-apply the selected pair after all four packages are installed if the
-> resolver changed it, then run the version checks below.
 
 ### Extras
 
@@ -62,165 +95,66 @@ The CUDA `gpu` extra is not used on NPU. NPU recipes override the attention back
 ```bash
 python -c "from importlib.metadata import version; import torch, torch_npu; print('torch', torch.__version__, '| torch-npu', version('torch-npu'), '| NPU', torch.npu.is_available())"
 python -c "import vllm; print('vllm', vllm.__version__)"
+python -c "import triton; from triton.backends import backends; print('triton', triton.__version__, sorted(backends))"
 python -c "from importlib.metadata import version; import vllm_ascend; print('vllm-ascend', version('vllm-ascend'))"
 python -c "from importlib.metadata import version; import vllm_omni; print('vllm-omni', version('vllm-omni'))"
 python -c "import verl; print('verl', verl.__version__)"
 python -c "import verl_omni; print('VeRL-Omni ready')"
 ```
 
-## Build Your Own Docker Image
+## Docker
 
-* Ascend Atlas A2 NPU Dockerfile: [`docker/Dockerfile.a2.npu`](https://github.com/verl-project/verl-omni/blob/main/docker/Dockerfile.a2.npu)
-* Ascend Atlas A3 NPU Dockerfile: [`docker/Dockerfile.a3.npu`](https://github.com/verl-project/verl-omni/blob/main/docker/Dockerfile.a3.npu)
+Use [`docker/Dockerfile.npu`](https://github.com/verl-project/verl-omni/blob/main/docker/Dockerfile.npu)
+for all supported Ascend devices. The image includes CANN, `torch-npu`,
+`vllm-ascend`, and `vllm-omni`.
 
-The NPU images are split by Ascend hardware generation: `Dockerfile.a2.npu` is intended for Ascend 910B / Atlas A2, and `Dockerfile.a3.npu` is intended for Ascend Atlas A3. Both NPU images include CANN, `torch-npu`, `vllm-ascend`, and `vllm-omni`.
+### Build
 
-The `torch` and `torch-npu` versions in these Dockerfiles are the currently
-validated image defaults, not a universal VeRL-Omni requirement. Each
-Dockerfile installs the selected pair before the engine stack, then re-applies
-the same pair after installing `vllm`, `vllm-ascend`, `vllm-omni`, and `verl`.
-This prevents their dependency resolvers from leaving the final image with a
-mixed PyTorch stack. When changing PyTorch versions, update both alignment
-steps together and keep the pair compatible with the image's CANN version.
-
-Build context is controlled by the repo-root [`.dockerignore`](https://github.com/verl-project/verl-omni/blob/main/.dockerignore); keep large local folders such as `.venv`, `data/`, and `checkpoints/` out of the context.
-
-NVIDIA GPU images are documented in the {doc}`GPU installation guide <install>`.
-
-## Ascend NPU Docker Image
-
-### Prerequisites
-
-The Ascend NPU Docker image expects the host machine to provide the Ascend driver and device files.
-
-Before launching the container, make sure the host has:
-
-* Ascend driver installed.
-* CANN-compatible runtime environment.
-* `npu-smi` available on the host.
-* Ascend device nodes under `/dev`, such as `/dev/davinci0`, `/dev/davinci_manager`, `/dev/devmm_svm`, and `/dev/hisi_hdc`.
-* Docker permission to pass NPU devices into the container.
-
-The NPU container mounts the host driver directory:
+Set `NPU_DEVICE` to `a2`, `a3` (default), or `a5`. The Dockerfile selects the
+base image and compiler target automatically.
 
 ```bash
--v /usr/local/Ascend/driver:/usr/local/Ascend/driver:ro
-```
+NPU_DEVICE=a5
 
-This allows the containerized CANN / `torch-npu` runtime to use the host Ascend driver.
-
-### Build commands
-
-From the repository root, choose the Dockerfile that matches your Ascend hardware.
-
-For Ascend Atlas A3:
-
-```bash
 docker build \
-  -f docker/Dockerfile.a3.npu \
-  -t verl-omni:npu-a3 \
+  -f docker/Dockerfile.npu \
+  --build-arg NPU_DEVICE=$NPU_DEVICE \
+  -t verl-omni:npu-$NPU_DEVICE \
   .
 ```
 
-For Ascend Atlas A2 / 910B:
+### Run
+
+The host needs the Ascend driver and firmware compatible with CANN 9.1.0.
+Set `NPU_DEVICE` to the image you built and `NPU_DEVICE_IDS` to the devices
+to expose, as listed by `npu-smi info`.
 
 ```bash
-docker build \
-  -f docker/Dockerfile.a2.npu \
-  -t verl-omni:npu-a2 \
-  .
-```
-
-When debugging dependency installation or making sure no old Docker layer is reused, add `--no-cache`:
-
-```bash
-# Atlas A3
-docker build --no-cache \
-  -f docker/Dockerfile.a3.npu \
-  -t verl-omni:npu-a3 \
-  .
-
-# Atlas A2 / 910B
-docker build --no-cache \
-  -f docker/Dockerfile.a2.npu \
-  -t verl-omni:npu-a2 \
-  .
-```
-
-You may choose different image tags locally. If you do so, replace the image name in the `docker run` command accordingly.
-
-### Launch on Ascend Atlas A3, 16 NPU
-
-Use this command on a 16-card Ascend Atlas A3 machine:
-
-```bash
-DEVICES=""
-for i in $(seq 0 15); do
-  DEVICES="$DEVICES --device=/dev/davinci$i"
+NPU_DEVICE=a5
+NPU_DEVICE_IDS=(0 1 2 3 4 5 6 7)
+DEVICES=()
+for id in "${NPU_DEVICE_IDS[@]}"; do
+  DEVICES+=(--device="/dev/davinci${id}")
+done
+for device in /dev/davinci_manager /dev/devmm_svm /dev/hisi_hdc; do
+  if [[ -e "$device" ]]; then
+    DEVICES+=(--device="$device")
+  fi
 done
 
 docker run -it --rm \
-  --name verl_omni_16npu \
+  --name verl_omni_npu \
   --network host \
   --ipc host \
-  $DEVICES \
-  --device=/dev/davinci_manager \
-  --device=/dev/devmm_svm \
-  --device=/dev/hisi_hdc \
+  "${DEVICES[@]}" \
   -v /usr/local/sbin/npu-smi:/usr/local/sbin/npu-smi:ro \
   -v /usr/local/Ascend/driver:/usr/local/Ascend/driver:ro \
   -v /mnt/data:/mnt/data \
-  verl-omni:npu-a3 \
+  verl-omni:npu-$NPU_DEVICE \
   bash
 ```
 
-### Launch on Ascend Atlas A2 / 910B, 8 NPU
-
-Use this command on an 8-card Ascend Atlas A2 / 910B machine:
-
-```bash
-DEVICES=""
-for i in $(seq 0 7); do
-  DEVICES="$DEVICES --device=/dev/davinci$i"
-done
-
-docker run -it --rm \
-  --name verl_omni_8npu \
-  --network host \
-  --ipc host \
-  $DEVICES \
-  --device=/dev/davinci_manager \
-  --device=/dev/devmm_svm \
-  --device=/dev/hisi_hdc \
-  -v /usr/local/sbin/npu-smi:/usr/local/sbin/npu-smi:ro \
-  -v /usr/local/Ascend/driver:/usr/local/Ascend/driver:ro \
-  -v /home:/home \
-  verl-omni:npu-a2 \
-  bash
-```
-
-### Notes for NPU containers
-
-* **`--network host`** — useful for Ray, distributed training, and multi-process communication.
-* **`--ipc host`** — avoids shared-memory limitations during training and rollout.
-* **`/dev/davinci*` devices** — expose Ascend NPU cards to the container.
-* **`/dev/davinci_manager`**, **`/dev/devmm_svm`**, and **`/dev/hisi_hdc`** — required Ascend runtime device files.
-* **`/usr/local/Ascend/driver`** — mounted read-only from the host so the container can use the installed Ascend driver.
-* **`npu-smi`** — mounted from the host to inspect device status inside the container.
-* **Atlas A3 16 NPU** — exposes `/dev/davinci0` through `/dev/davinci15`.
-* **Atlas A2 / 910B 8 NPU** — exposes `/dev/davinci0` through `/dev/davinci7`.
-
-Inside the container, confirm the NPU environment:
-
-```bash
-npu-smi info
-python -c "from importlib.metadata import version; import torch, torch_npu; print('torch', torch.__version__, '| torch-npu', version('torch-npu'), '| NPU', torch.npu.is_available())"
-python -c "import vllm; print('vllm', vllm.__version__)"
-python -c "from importlib.metadata import version; import vllm_ascend; print('vllm-ascend', version('vllm-ascend'))"
-python -c "from importlib.metadata import version; import vllm_omni; print('vllm-omni', version('vllm-omni'))"
-python -c "import verl; print('verl', verl.__version__)"
-python -c "import verl_omni; print('VeRL-Omni ready')"
-```
+Inside the container, run the [post-installation checks](#post-installation-verification).
 
 ## Example: Qwen-Image FlowGRPO training in Docker
 
@@ -234,7 +168,7 @@ actor_rollout_ref.model.attn_backend=_native_npu
 
 ### 1. Launch the interactive container
 
-Use the Atlas A2 or A3 launch command above.
+Use the Docker launch command above.
 
 ### 2. Prepare the OCR dataset inside the container
 

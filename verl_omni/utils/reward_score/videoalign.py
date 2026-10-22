@@ -22,7 +22,7 @@ import torch
 import torch.nn.functional as F
 
 from .hpsv3_reward import Qwen2VLRewardModelBT, smart_resize
-from .reward_utils import load_torch_state_dict
+from .reward_utils import load_torch_state_dict, video_reward_tensor
 
 _SPECIAL_TOKENS = ("<|VQ_reward|>", "<|MQ_reward|>", "<|TA_reward|>")
 _TARGET_FPS = 24.0
@@ -262,6 +262,7 @@ async def compute_score(
     fps = float(fps)
     if not math.isfinite(fps) or fps <= 0:
         raise ValueError("VideoAlign fps must be finite and positive.")
+    solution_image = video_reward_tensor(solution_image, extra_info, fps)
     if (
         not isinstance(solution_image, torch.Tensor)
         or solution_image.ndim != 4
