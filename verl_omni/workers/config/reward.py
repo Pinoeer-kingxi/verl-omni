@@ -392,8 +392,6 @@ def reward_role_required(config) -> bool:
             continue
         placement = model.get("placement") or {}
         resource = placement.get("resource", "accelerator")
-        if resource not in ("accelerator", "cpu"):
-            raise ValueError(f"Unsupported native reward placement resource {resource!r}")
         if resource == "accelerator":
             return True
     return False

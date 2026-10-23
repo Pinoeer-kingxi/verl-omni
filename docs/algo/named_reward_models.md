@@ -1,6 +1,6 @@
 # Named Reward Models
 
-Last updated: 10/13/2026
+Last updated: 10/23/2026
 
 This guide describes how to configure and extend named model-backed rewards
 under `reward.models` in `verl-omni`. For the general Reward Loop interface and
@@ -437,9 +437,11 @@ caller cancellation also waits for accepted calls before unloading. This wait
 has no timeout: a scoring RPC that never returns can block cleanup. CPU
 placement does not add forced worker termination or automatic retries.
 
-With `offload=false`, models remain resident. If a deployment explicitly enables
+With `offload=false`, models remain resident. If a CPU deployment explicitly enables
 Ray actor restarts, the next scoring phase initializes a restarted actor again.
-Production worker creation does not enable automatic restarts.
+Production worker creation does not enable automatic restarts. Accelerator
+deployments with `offload=false` skip repeated wake-ups and do not provide this
+restart recovery.
 
 ### Wrap a Transformers model for native mode
 

@@ -218,6 +218,7 @@ async def test_replica_dispatch_reaches_native_pickscore_consumer_with_batch_cap
     assert all(size <= max_batch_size for size in infer_batch_sizes)
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["wrapped", "unwrapped", "slow"])
 async def test_native_model_close_releases_native_tokenizer_decode_wrapper(monkeypatch, mode):
     from tokenizers import Tokenizer
