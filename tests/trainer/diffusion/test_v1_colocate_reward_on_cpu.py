@@ -14,8 +14,10 @@
 """CPU test for the colocated reward-model step of the v1 diffusion trainer."""
 
 import os
+import threading
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 from hydra import compose, initialize_config_dir
@@ -169,3 +171,166 @@ def test_colocate_reward_wakes_rollout_mid_cycle_in_async_mode(monkeypatch):
         trainer._train_sampled_batch({}, {}, object())
 
     assert calls == ["sleep", "reward", "update_weights", "balance"]
+
+
+@pytest.mark.parametrize("dp_size", [1, 3])
+def test_dedicated_reward_overlaps_old_log_prob_and_preserves_rows(monkeypatch, dp_size):
+    from verl_omni.trainer.diffusion.v1 import get_diffusion_trainer_cls
+
+    trainer = get_diffusion_trainer_cls("colocate_async")(
+        compose_cfg(
+            [
+                "trainer.v1.trainer_mode=colocate_async",
+                "reward.reward_model.enable=true",
+                "reward.reward_model.enable_resource_pool=true",
+                "data.train_batch_size=4",
+                "actor_rollout_ref.actor.ppo_mini_batch_size=2",
+                "actor_rollout_ref.rollout.n=1",
+            ]
+        )
+    )
+    trainer.reward_loop_manager = SimpleNamespace(reward_loop_worker_handles=None)
+    trainer.actor_rollout_wg = SimpleNamespace(_query_dispatch_info=lambda mesh: {i: i for i in range(dp_size)})
+    data = DataProto.from_tensordict(tu.get_tensordict({"all_timesteps": torch.arange(4).unsqueeze(1)}))
+    scores = torch.arange(1, 5, dtype=torch.float32).unsqueeze(1)
+    reward = DataProto.from_dict(
+        tensors={"rm_scores": scores},
+        non_tensors={"ocr": np.array(["a", "b", "c", "d"])},
+        meta_info={"reward_extra_keys": ["ocr"]},
+    )
+    rendezvous = threading.Barrier(2)
+    reward_done = threading.Event()
+    log_prob_done = threading.Event()
+
+    def compute_reward(original):
+        assert original is data and len(original) == 4
+        rendezvous.wait(timeout=5)
+        assert log_prob_done.wait(timeout=5)
+        assert "old_log_probs" not in original.batch
+        reward_done.set()
+        return reward
+
+    def compute_log_prob(balanced):
+        rendezvous.wait(timeout=5)
+        values = balanced.batch["all_timesteps"].float()
+        log_prob_done.set()
+        return DataProto.from_tensordict(tu.get_tensordict({"old_log_probs": values}))
+
+    monkeypatch.setattr(trainer, "_compute_reward_colocate", compute_reward)
+    monkeypatch.setattr(trainer, "_compute_old_log_prob", compute_log_prob)
+    monkeypatch.setattr(
+        "verl_omni.trainer.diffusion.v1.trainer_base.compute_rollout_corr_metrics_from_batch",
+        lambda data, bypass_mode: {},
+    )
+
+    def advantage(joined):
+        assert reward_done.is_set() and log_prob_done.is_set()
+        joined.batch["advantages"] = torch.ones(len(joined), 1)
+        return joined
+
+    captured = {}
+    monkeypatch.setattr(trainer, "_compute_advantage", advantage)
+
+    def update(joined):
+        captured["data"] = joined
+        raise _Stop
+
+    monkeypatch.setattr(trainer, "_update_actor", update)
+    timing = {}
+    with pytest.raises(_Stop):
+        trainer._train_sampled_batch({}, timing, object(), data=data)
+
+    expected = [0, 1, 2, 3] if dp_size == 1 else [0, 1, 2, 3, 0, 1]
+    joined = captured["data"]
+    assert joined.batch["old_log_probs"].flatten().tolist() == expected
+    assert joined.batch["rm_scores"].flatten().tolist() == [i + 1 for i in expected]
+    assert joined.non_tensor_batch["ocr"].tolist() == ["abcd"[i] for i in expected]
+    assert joined.meta_info["reward_extra_keys"] == ["ocr"]
+    assert joined.batch["advantages"].flatten().tolist() == [1.0] * 4 + [0.0] * (len(expected) - 4)
+    assert {"reward", "old_log_prob"} <= timing.keys()
+
+
+@pytest.mark.parametrize("failed_phase", ["reward", "old_log_prob"])
+def test_dedicated_reward_overlap_drains_work_before_raising(monkeypatch, failed_phase):
+    from verl_omni.trainer.diffusion.v1 import get_diffusion_trainer_cls
+
+    trainer = get_diffusion_trainer_cls("colocate_async")(
+        compose_cfg(
+            [
+                "trainer.v1.trainer_mode=colocate_async",
+                "reward.reward_model.enable=true",
+                "reward.reward_model.enable_resource_pool=true",
+                "data.train_batch_size=4",
+                "actor_rollout_ref.actor.ppo_mini_batch_size=2",
+            ]
+        )
+    )
+    trainer.reward_loop_manager = SimpleNamespace(reward_loop_worker_handles=None)
+    data = DataProto.from_tensordict(tu.get_tensordict({"all_timesteps": torch.zeros(4, 1)}))
+    monkeypatch.setattr(trainer, "_balance_batch", lambda value, metrics: value)
+    rendezvous = threading.Barrier(2)
+    reward_settled = threading.Event()
+
+    def reward(value):
+        try:
+            rendezvous.wait(timeout=5)
+            if failed_phase == "reward":
+                raise RuntimeError("reward failed")
+            return DataProto.from_tensordict(tu.get_tensordict({"rm_scores": torch.ones(4, 1)}))
+        finally:
+            reward_settled.set()
+
+    def old_log_prob(value):
+        rendezvous.wait(timeout=5)
+        if failed_phase == "old_log_prob":
+            raise RuntimeError("old_log_prob failed")
+        return DataProto.from_tensordict(tu.get_tensordict({"old_log_probs": torch.zeros(4, 1)}))
+
+    monkeypatch.setattr(trainer, "_compute_reward_colocate", reward)
+    monkeypatch.setattr(trainer, "_compute_old_log_prob", old_log_prob)
+    with pytest.raises(RuntimeError, match=f"{failed_phase} failed"):
+        trainer._train_sampled_batch({}, {}, object(), data=data)
+    assert reward_settled.is_set()
+
+
+def test_dedicated_reward_stays_serial_when_old_log_prob_is_bypassed(monkeypatch):
+    from verl_omni.trainer.diffusion.v1 import get_diffusion_trainer_cls
+
+    trainer = get_diffusion_trainer_cls("colocate_async")(
+        compose_cfg(
+            [
+                "trainer.v1.trainer_mode=colocate_async",
+                "reward.reward_model.enable=true",
+                "reward.reward_model.enable_resource_pool=true",
+                "data.train_batch_size=4",
+                "actor_rollout_ref.actor.ppo_mini_batch_size=2",
+                "actor_rollout_ref.rollout.calculate_log_probs=true",
+                "algorithm.rollout_correction.bypass_mode=true",
+            ]
+        )
+    )
+    trainer.reward_loop_manager = SimpleNamespace(reward_loop_worker_handles=None)
+    data = DataProto.from_tensordict(tu.get_tensordict({"rollout_log_probs": torch.ones(4, 1)}))
+    reward = DataProto.from_tensordict(tu.get_tensordict({"rm_scores": torch.ones(4, 1)}))
+    monkeypatch.setattr(trainer, "_compute_reward_colocate", lambda value: reward)
+
+    def balance(scored, metrics):
+        assert "rm_scores" in scored.batch
+        assert "old_log_probs" not in scored.batch
+        return scored
+
+    monkeypatch.setattr(trainer, "_balance_batch", balance)
+    monkeypatch.setattr(trainer, "_compute_old_log_prob", lambda value: pytest.fail("bypass recomputed log-probs"))
+    monkeypatch.setattr(
+        "verl_omni.trainer.diffusion.v1.trainer_base.compute_rollout_corr_metrics_from_batch",
+        lambda data, bypass_mode: {},
+    )
+    monkeypatch.setattr(trainer, "_compute_advantage", lambda value: value)
+
+    def update(prepared):
+        torch.testing.assert_close(prepared.batch["old_log_probs"], prepared.batch["rollout_log_probs"])
+        raise _Stop
+
+    monkeypatch.setattr(trainer, "_update_actor", update)
+    with pytest.raises(_Stop):
+        trainer._train_sampled_batch({}, {}, object(), data=data)

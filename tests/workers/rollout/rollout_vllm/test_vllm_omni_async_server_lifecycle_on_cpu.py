@@ -152,6 +152,28 @@ async def test_abort_with_no_in_flight_requests_still_pauses():
     assert result == {"aborted_count": 0, "request_ids": []}
 
 
+async def test_resident_rollout_pauses_until_explicit_resume_without_sleeping():
+    class LateAdmissionEngine(_FakeAsyncOmni):
+        async def pause_generation(self, **kwargs):
+            await super().pause_generation(**kwargs)
+            if kwargs["mode"] == "keep":
+                self.request_states["late"] = _FakeRequestState("late", "late-external")
+
+    engine = LateAdmissionEngine()
+    server = _make_server(engine, free_cache_engine=False)
+
+    await server.abort_all_requests()
+    await server.sleep()
+    assert engine.calls == ["pause", "abort", "pause"]
+    assert engine.pause_calls[0]["mode"] == "keep"
+    assert engine.abort_calls == [["late-external"]]
+    assert engine.sleep_calls == []
+    assert engine.resumed == 0
+
+    await server.resume_generation()
+    assert engine.resumed == 1
+
+
 # ---------------------------------------------------------------------------
 # abort outputs arrive via the request queues; mapper untouched
 # ---------------------------------------------------------------------------

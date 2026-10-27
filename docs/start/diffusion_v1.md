@@ -1,6 +1,6 @@
 # Diffusion V1 training
 
-Last updated: 10/12/2026
+Last updated: 10/25/2026
 
 This guide runs the diffusion V1 trainer in synchronous, colocated-asynchronous or separate-asynchronous
 mode using the provided Stable Diffusion 3.5 Medium FlowGRPO OCR recipes.
@@ -138,15 +138,28 @@ bash examples/flowgrpo_trainer/sd35/run_sd35_medium_ocr_lora_v1_colocate_async.s
 ```
 
 The recipe reuses the sync model, loss and OCR reward settings and enables actor
-parameter/optimizer offload. It requires `rollout.nnodes=0`, the `naive`
-checkpoint backend and `rollout.free_cache_engine=true`. There is one weight
+parameter/optimizer offload. It requires `rollout.nnodes=0` and the `naive`
+checkpoint backend. There is one weight
 sync per trainer step; existing actor PPO mini-batches remain unchanged, and
 `train_batch_size` must be divisible by `ppo_mini_batch_size`.
 
+By default, `actor_rollout_ref.rollout.free_cache_engine=true` releases rollout
+weights during actor computation. If rollout weights and actor training fit in
+GPU memory together, set it to `false` to keep rollout weights resident and avoid
+their CPU offload and reload each step. Generation still pauses during actor
+computation and resumes after the new weights are installed. Measure peak GPU
+memory with the chosen image resolution and actor micro-batch size.
+
+For SD3.5 LoRA runs with available actor memory, pass
+`actor_rollout_ref.model.enable_gradient_checkpointing=false` to avoid
+recomputing transformer activations during backward. This trades higher
+activation memory for less computation; measure peak memory at the chosen
+image resolution and actor micro-batch size. The default remains enabled.
+
 `trainer.v1.colocate_async.num_warmup_batches` controls the queued backlog
 (default 1, use 0 for no warmup). Training samples only complete prompt groups.
-Before actor computation, the trainer closes routing, aborts unfinished
-requests and sleeps rollout weights. After training, it installs the new
+Before actor computation, the trainer closes routing and aborts unfinished
+requests. It sleeps rollout weights when `free_cache_engine=true`. After training, it installs the new
 weights and resumes generation before reopening routing. Aborted diffusion
 samples restart from their original inputs and seed. Configured rollout seeds
 are saved per prompt in TransferQueue and retained when pending groups resume

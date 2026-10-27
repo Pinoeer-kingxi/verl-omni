@@ -379,7 +379,14 @@ def test_v1_rollout_dump_sorts_and_forwards_media_metadata(monkeypatch, media_ki
             "audio_sample_rate": np.array([48_000, 48_000], dtype=object),
         },
     )
-    monkeypatch.setattr(trainer_base_module, "diffusion_tq_batch_to_dataproto", lambda *args, **kwargs: data)
+
+    def read_media(*args, select_fields, **kwargs):
+        assert set(data.batch) <= set(select_fields)
+        assert set(data.non_tensor_batch) <= set(select_fields)
+        assert {"all_latents", "prompt_embeds", "old_log_probs", "advantages"}.isdisjoint(select_fields)
+        return data
+
+    monkeypatch.setattr(trainer_base_module, "diffusion_tq_batch_to_dataproto", read_media)
 
     batch_meta = SimpleNamespace(keys=["second_0_0", "first_0_0"], partition_id="train")
     if media_kinds != ["video", "video"]:

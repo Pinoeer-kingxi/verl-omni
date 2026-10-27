@@ -35,8 +35,6 @@ class PolicyGradientDiffusionTrainerV1ColocateAsync(PolicyGradientDiffusionTrain
         rollout = config.actor_rollout_ref.rollout
         if rollout.nnodes != 0 or rollout.checkpoint_engine.backend != "naive":
             raise ValueError("colocate_async requires colocated rollout (nnodes=0) and checkpoint_engine.backend=naive")
-        if not rollout.free_cache_engine:
-            raise ValueError("colocate_async requires rollout.free_cache_engine=true to reclaim rollout GPU memory")
         if config.trainer.v1.colocate_async.get("parameter_sync_step", 1) != 1:
             raise ValueError("colocate_async supports one parameter sync per step (parameter_sync_step=1)")
         warmup = config.trainer.v1.colocate_async.num_warmup_batches

@@ -35,6 +35,7 @@ from verl_omni.agent_loop.diffusion_agent_loop import (
 from verl_omni.agent_loop.diffusion_agent_loop_tq import DiffusionAgentLoopWorkerTQ
 from verl_omni.agent_loop.single_turn_agent_loop import DiffusionSingleTurnAgentLoop
 from verl_omni.trainer.diffusion.v1 import tq_utils
+from verl_omni.trainer.diffusion.v1.trainer_sync import PolicyGradientDiffusionTrainerV1Sync
 
 
 class _FakeRemoteComputeScore:
@@ -56,6 +57,48 @@ class _DummyDiffusionAgentLoopWorker:
 
     def __init__(self, reward_loop_worker_handle: _FakeRewardLoopWorkerHandle):
         self.reward_loop_worker_handles = [reward_loop_worker_handle]
+
+
+@pytest.mark.asyncio
+async def test_single_prompt_fetches_preserve_v0_noise_offsets(monkeypatch):
+    trainer = object.__new__(PolicyGradientDiffusionTrainerV1Sync)
+    trainer.config = SimpleNamespace(
+        data=SimpleNamespace(train_batch_size=4),
+        actor_rollout_ref=SimpleNamespace(rollout={"seed": 42}),
+    )
+    trainer.global_steps = 1
+    trainer._gen_batch_seq = 0
+    trainer._rollout_seed_step = None
+    trainer._rollout_seed_next_index = 0
+    trainer.train_dataloader_it = None
+    trainer._effective_generation_batch_size = 1
+    trainer.train_dataloader = [{"raw_prompt": np.array([str(i)], dtype=object)} for i in range(4)]
+    batch = trainer._next_train_batch()
+
+    worker_cls = DiffusionAgentLoopWorkerTQ.__ray_metadata__.modified_class
+    worker = object.__new__(worker_cls)
+    worker.background_tasks = set()
+    worker.rollout_config = SimpleNamespace(
+        n=4,
+        pipeline={},
+        algo={},
+        calculate_log_probs=False,
+        agent=SimpleNamespace(default_agent_loop="diffusion_single_turn_agent"),
+    )
+    seen = []
+
+    async def run_agent_loop(sampling_params, **kwargs):
+        seen.append(sampling_params["seed"])
+
+    worker._run_agent_loop = run_agent_loop
+    worker._write_trajectories_to_tq = AsyncMock(return_value=0)
+    monkeypatch.setattr(diffusion_agent_loop_tq.tq, "async_kv_put", AsyncMock())
+    monkeypatch.setattr(diffusion_agent_loop_tq, "_config_to_sampling_dict", lambda value: {})
+    # Exercise the same two-worker split used by the real manager after fetch/concat.
+    for chunk in batch.split(2):
+        await worker.generate_sequences(chunk)
+    await asyncio.gather(*worker.background_tasks)
+    assert sorted(seen) == [diffusion_agent_loop_tq._derive_rollout_seed(42, i) for i in range(16)]
 
 
 @pytest.mark.parametrize(

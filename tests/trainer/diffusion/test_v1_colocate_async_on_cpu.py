@@ -57,7 +57,6 @@ def test_registered_trainer_uses_async_groups_and_exact_refill():
     [
         ("actor_rollout_ref.rollout.nnodes=1", "colocated rollout"),
         ("actor_rollout_ref.rollout.checkpoint_engine.backend=nccl", "backend=naive"),
-        ("actor_rollout_ref.rollout.free_cache_engine=false", "reclaim rollout GPU memory"),
         ("trainer.v1.colocate_async.num_warmup_batches=-1", "nonnegative integer"),
         ("trainer.v1.colocate_async.num_warmup_batches=1.5", "nonnegative integer"),
         ("+trainer.v1.colocate_async.parameter_sync_step=2", "one parameter sync"),
@@ -79,8 +78,11 @@ def _remote(fn):
 
 
 @pytest.mark.parametrize("profile", [False, True])
-def test_routing_stays_closed_from_abort_through_weight_commit(monkeypatch, profile):
-    trainer = PolicyGradientDiffusionTrainerV1ColocateAsync(_config())
+@pytest.mark.parametrize("free_cache", [False, True])
+def test_routing_stays_closed_from_abort_through_weight_commit(monkeypatch, profile, free_cache):
+    trainer = PolicyGradientDiffusionTrainerV1ColocateAsync(
+        _config(f"actor_rollout_ref.rollout.free_cache_engine={str(free_cache).lower()}")
+    )
     events = []
     trainer.global_steps = 3
     trainer.curr_step_profile = profile
@@ -135,8 +137,14 @@ def test_warmup_tops_up_restored_groups(monkeypatch, queued, expected):
     assert added == expected
 
 
-def test_validation_reclaims_rollout_before_colocated_reward(monkeypatch):
-    trainer = PolicyGradientDiffusionTrainerV1ColocateAsync(_config("reward.reward_model.enable=true"))
+@pytest.mark.parametrize("separate_reward", [False, True])
+def test_validation_reclaims_rollout_only_for_colocated_reward(monkeypatch, separate_reward):
+    trainer = PolicyGradientDiffusionTrainerV1ColocateAsync(
+        _config(
+            "reward.reward_model.enable=true",
+            f"reward.reward_model.enable_resource_pool={str(separate_reward).lower()}",
+        )
+    )
     trainer.global_steps = 0
     trainer._gen_batch_seq = 0
     trainer.val_dataloader = [{"raw_prompt": [[{"role": "user", "content": "prompt"}]]}]
@@ -162,4 +170,4 @@ def test_validation_reclaims_rollout_before_colocated_reward(monkeypatch):
     trainer.tokenizer = SimpleNamespace(pad_token_id=0, decode=decode)
     with pytest.raises(StopAfterReward):
         trainer._validate()
-    assert events == ["abort/sleep", "reward", "commit/resume"]
+    assert events == (["reward"] if separate_reward else ["abort/sleep", "reward", "commit/resume"])

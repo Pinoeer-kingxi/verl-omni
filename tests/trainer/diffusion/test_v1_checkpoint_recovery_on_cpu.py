@@ -206,6 +206,8 @@ def test_transfer_queue_checkpoint_roundtrip_and_reissue(initialized_tq, tmp_pat
         }
     )
     chunks = iter(prompt_batch.split(1))
+    trainer._rollout_seed_step = None
+    trainer._rollout_seed_next_index = 0
     trainer._fetch_one_gen_batch = lambda: next(chunks)
     prompt_batch = trainer._next_train_batch()
     trainer.agent_loop_manager = SimpleNamespace(generate_sequences=lambda batch: None)
@@ -252,11 +254,13 @@ def test_transfer_queue_checkpoint_roundtrip_and_reissue(initialized_tq, tmp_pat
         assert list(submitted[0]["raw_prompt"]) == ["pending prompt"]
         assert int(submitted[0]["global_steps"]) == 4
         assert int(submitted[0]["rollout_seed"][0]) == 44
+        assert int(submitted[0]["rollout_seed_index"][0]) == 0
         persisted_prompt = tq.kv_batch_get(keys=[pending], partition_id=partition_id)
         assert list(persisted_prompt["uid"]) == [pending]
         assert list(persisted_prompt["raw_prompt"]) == ["pending prompt"]
         assert int(persisted_prompt["index"][0]) == 0
         assert int(persisted_prompt["rollout_seed"][0]) == 44
+        assert int(persisted_prompt["rollout_seed_index"][0]) == 0
     finally:
         tq.kv_clear(keys=list(tq.kv_list(partition_id)[partition_id]), partition_id=partition_id)
 

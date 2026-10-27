@@ -485,6 +485,9 @@ class vLLMOmniHttpServer(vLLMHttpServer):
         if getattr(engine, "output_processor", None) is not None:
             return await super().abort_all_requests(reset_prefix_cache)
 
+        if not self.config.free_cache_engine:
+            await engine.pause_generation(mode="keep", clear_cache=reset_prefix_cache)
+
         # ``engine.abort`` takes EXTERNAL ids; ``request_states`` is keyed by internal.
         in_flight: list[tuple[str, str, Any]] = []
         seen: set[str] = set()

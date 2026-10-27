@@ -19,6 +19,7 @@ import uuid
 from abc import ABC, abstractmethod
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from numbers import Integral
 from pprint import pprint
 
@@ -538,40 +539,41 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         if data is None:
             data = diffusion_tq_batch_to_dataproto(batch_meta, pad_token_id=self.tokenizer.pad_token_id or 0)
 
-        # [OPTIONAL] colocated reward model
-        if self.reward_loop_manager.reward_loop_worker_handles is None and self.use_rm:
-            with marked_timer("reward", timing_raw, color="yellow"):
-                # Both colocated modes sleep rollout before entering training.
-                # Separate-async retains its explicit mid-cycle reward switch.
-                if self.trainer_mode == "separate_async":
-                    self.checkpoint_manager.sleep_replicas()
-                data = data.union(self._compute_reward_colocate(data))
-                if self.trainer_mode == "separate_async":
-                    # Async modes have no guaranteed per-step wake of the
-                    # colocated replicas (separate_async's on_step_end only
-                    # syncs the standalone rollout, and switch_to_rollout is
-                    # not guaranteed to fire), so keep the mid-cycle wake+sync
-                    # or colocated generation stalls on stale weights.
-                    self.checkpoint_manager.update_weights(self.global_steps)
-                # In sync mode the replicas must stay asleep through the
-                # training phases below: update_weights resumes their weights
-                # (~55GB for Qwen-Image at rollout TP=1) and the actor update
-                # would OOM next to them. on_step_end wakes and weight-syncs
-                # for the next rollout.
-
-        if self._is_direct_preference:
-            return self._train_direct_preference_batch(metrics, timing_raw, batch_meta, data)
-
-        data = self._balance_batch(data, metrics=metrics)
-
         # Bypass mode: skip old_log_prob recompute (2 policies).
         rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
         bypass_recomputing_logprobs = bool(rollout_corr_config and rollout_corr_config.get("bypass_mode", False))
-        if bypass_recomputing_logprobs:
-            apply_bypass_mode_to_diffusion_batch(data)
-        else:
-            with marked_timer("old_log_prob", timing_raw, color="blue"):
-                old_log_prob = self._compute_old_log_prob(data)
+        compute_reward = self.reward_loop_manager.reward_loop_worker_handles is None and self.use_rm
+        overlap_reward = (
+            compute_reward
+            and self.trainer_mode == "colocate_async"
+            and reward_pool_is_separate(self.config)
+            and not self._is_direct_preference
+            and not bypass_recomputing_logprobs
+        )
+        # Both phases read the rollout snapshot. Join the step-local worker
+        # before advantage computation, including when either phase fails.
+        with ThreadPoolExecutor(max_workers=1) if overlap_reward else nullcontext() as reward_executor:
+            reward_future = None
+            if compute_reward:
+                if overlap_reward:
+                    reward_future = reward_executor.submit(self._compute_training_reward, data, timing_raw)
+                else:
+                    data = data.union(self._compute_training_reward(data, timing_raw))
+
+            if self._is_direct_preference:
+                return self._train_direct_preference_batch(metrics, timing_raw, batch_meta, data)
+
+            data = self._balance_batch(data, metrics=metrics)
+            if bypass_recomputing_logprobs:
+                apply_bypass_mode_to_diffusion_batch(data)
+            else:
+                with marked_timer("old_log_prob", timing_raw, color="blue"):
+                    old_log_prob = self._compute_old_log_prob(data)
+
+            if reward_future is not None:
+                reward, _ = pad_dataproto_to_divisor(reward_future.result(), len(data))
+                data = data.union(reward)
+            if not bypass_recomputing_logprobs:
                 data = data.union(old_log_prob)
 
         assert "old_log_probs" in data.batch, f'"old_log_probs" not in {data.batch.keys()}'
@@ -630,6 +632,16 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             fields=diffusion_persisted_tq_fields("policy_gradient"),
         )
         return batch_meta
+
+    def _compute_training_reward(self, data: DataProto, timing_raw: dict) -> DataProto:
+        """Score the original rows, preserving the separate-async reward switch."""
+        with marked_timer("reward", timing_raw, color="yellow"):
+            if self.trainer_mode == "separate_async":
+                self.checkpoint_manager.sleep_replicas()
+            reward = self._compute_reward_colocate(data)
+            if self.trainer_mode == "separate_async":
+                self.checkpoint_manager.update_weights(self.global_steps)
+        return reward
 
     def _validate_old_adapter_config(self):
         """Require the NFT old-adapter rollout/loss contract."""
@@ -924,6 +936,9 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         # Per-run monotonic generation-batch number; pairs with the batch-local
         # ``index`` so TQ row ordering survives multi-batch sampling paths.
         self._gen_batch_seq = 0
+        # Prompts already given a rollout seed position in ``_rollout_seed_step``.
+        self._rollout_seed_step = None
+        self._rollout_seed_next_index = 0
         val_batch_size = self.config.data.val_batch_size or len(self.val_dataset)
         self.val_dataloader = StatefulDataLoader(
             dataset=self.val_dataset,
@@ -1211,6 +1226,14 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             batch["rollout_seed"] = torch.full(
                 (len(batch),), int(rollout_seed_cfg) + self.global_steps - 1, dtype=torch.int64
             )
+            # ``index`` restarts in every generation batch, and refills reuse this
+            # step's seed base, so seed from the position among the step's prompts.
+            if self._rollout_seed_step != self.global_steps:
+                self._rollout_seed_step = self.global_steps
+                self._rollout_seed_next_index = 0
+            start = self._rollout_seed_next_index
+            self._rollout_seed_next_index += len(batch)
+            batch["rollout_seed_index"] = torch.arange(start, start + len(batch), dtype=torch.int64)
         return batch
 
     @staticmethod
@@ -1551,15 +1574,19 @@ class PolicyGradientDiffusionTrainerV1(ABC):
                 continue
 
             if self.use_rm and self.reward_loop_manager.reward_loop_worker_handles is None:
-                if self.trainer_mode == "colocate_async":
-                    self.on_sample_end()
-                else:
-                    self.checkpoint_manager.sleep_replicas()
+                # Driver-side reward scoring can also use a separate GPU pool.
+                colocated_reward = not reward_pool_is_separate(self.config)
+                if colocated_reward:
+                    if self.trainer_mode == "colocate_async":
+                        self.on_sample_end()
+                    else:
+                        self.checkpoint_manager.sleep_replicas()
                 data = data.union(self._compute_reward_colocate(data))
-                if self.trainer_mode == "colocate_async":
-                    self.on_step_end()
-                else:
-                    self.checkpoint_manager.update_weights(self.global_steps)
+                if colocated_reward:
+                    if self.trainer_mode == "colocate_async":
+                        self.on_step_end()
+                    else:
+                        self.checkpoint_manager.update_weights(self.global_steps)
 
             input_ids = data.batch["prompts"]
             input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
@@ -1702,7 +1729,22 @@ class PolicyGradientDiffusionTrainerV1(ABC):
     def _log_rollout_data(self, batch_meta: KVBatchMeta, timing_raw: dict, rollout_data_dir: str):
         """Fetch rollout rows from TQ and dump sorted by uid."""
         with marked_timer("dump_rollout_generations", timing_raw, color="green"):
-            data = diffusion_tq_batch_to_dataproto(batch_meta, pad_token_id=self.tokenizer.pad_token_id or 0)
+            data = diffusion_tq_batch_to_dataproto(
+                batch_meta,
+                pad_token_id=self.tokenizer.pad_token_id or 0,
+                select_fields=[
+                    "prompts",
+                    "responses",
+                    "sample_level_scores",
+                    "rm_scores",
+                    "reward_model",
+                    "extra_fields",
+                    "tool_extra_fields",
+                    "audio",
+                    "audio_sample_rate",
+                    "media_kind",
+                ],
+            )
             inputs = self.tokenizer.batch_decode(data.batch["prompts"], skip_special_tokens=True)
             outputs = data.batch["responses"]
             scores = (
