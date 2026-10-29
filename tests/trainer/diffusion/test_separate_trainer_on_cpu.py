@@ -218,7 +218,7 @@ def test_rollout_stack_selects_manager_arguments_and_sleep(
     class FakeRewardLoopManager:
         def __init__(self, **kwargs):
             events.append(("reward", kwargs))
-            self.reward_loop_worker_handles = []
+            self.reward_loop_workers = []
 
     class FakeLLMServerManager:
         @classmethod
