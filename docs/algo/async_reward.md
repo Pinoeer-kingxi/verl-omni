@@ -1,7 +1,7 @@
 (async_reward)=
 # Async Reward for Diffusion Training
 
-Last updated: 10/10/2026
+Last updated: 10/28/2026.
 
 Async reward lets VeRL-Omni score completed rollout samples through reward-loop
 workers while other samples are still being generated. It is useful when reward
@@ -119,17 +119,29 @@ reward_loop_worker_handles = self.reward_loop_manager.reward_loop_worker_handles
 The diffusion agent loop runs one async task per rollout sample. After a sample
 finishes generation, `_compute_score` builds a one-sample `DataProto` containing
 the prompt, visual response, and reward metadata, then sends it to a reward-loop
-worker. The legacy path chooses one replica; the named path sends the sample to
-one replica from each group and combines their already weighted results:
+worker. Both legacy and named handles are adapted to `AsyncRewardClient` inside
+each agent worker. The agent calls the same scoring interface:
 
 ```python
-selected_reward_loop_worker_handle = random.choice(
-    self.reward_loop_worker_handles
-)
-result = await selected_reward_loop_worker_handle.compute_score.remote(data)
+result = await self.async_reward_client.compute_score(data)
 output.reward_score = result["reward_score"]
 output.extra_fields["reward_extra_info"] = result["reward_extra_info"]
 ```
+
+The legacy adapter chooses one replica and uses its existing `compute_score`
+RPC, preserving legacy concurrency and cancellation behavior. The named adapter
+chooses one replica per group, dispatches a one-sample `compute_score_batch` RPC
+through the existing replica dispatcher, and combines the already weighted
+results. Selecting one replica avoids batch padding duplicating a sample across
+replicas.
+
+For named streaming, the agent holds `sample_slot()` from generation through
+scoring and drain. Scoring does not acquire another slot. The client applies the
+configured scoring deadline and retains ownership of accepted requests after
+cancellation or timeout. The V1 runner waits for agent shutdown before closing
+native reward models and TransferQueue. See
+[Named Reward Models](named_reward_models.md#sample-level-streaming) for supported
+placement, admission bounds, and failure behavior.
 
 When the rollout manager returns to the trainer, samples that were scored through
 the reward loop already contain `rm_scores`. The trainer therefore skips the
@@ -141,8 +153,10 @@ if self.use_rm and "rm_scores" not in batch.batch.keys():
     batch = batch.union(batch_reward)
 ```
 
-This is why async reward can reduce the measured `reward` section in the trainer
-timer: the reward work has already been streamed during generation.
+The trainer's `reward` timer measures the remaining scoring wait. A shorter timer
+does not establish a faster training step: per-sample scoring can reduce inference
+batch sizes, and scoring may already overlap other actor work. Compare full-step
+time and throughput with the same resident models, data and concurrency.
 
 ## Profiling the reward servers
 

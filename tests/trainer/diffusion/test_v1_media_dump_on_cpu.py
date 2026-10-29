@@ -380,6 +380,7 @@ def test_v1_rollout_dump_sorts_and_forwards_media_metadata(monkeypatch, media_ki
         },
     )
     monkeypatch.setattr(trainer_base_module, "diffusion_tq_batch_to_dataproto", lambda *args, **kwargs: data)
+    monkeypatch.setattr(trainer_base_module, "diffusion_dump_tq_fields", lambda batch_meta: [])
 
     batch_meta = SimpleNamespace(keys=["second_0_0", "first_0_0"], partition_id="train")
     if media_kinds != ["video", "video"]:
@@ -417,6 +418,7 @@ def test_v1_rollout_dump_uses_tool_media_when_batch_has_no_generated_media(monke
         },
     )
     monkeypatch.setattr(trainer_base_module, "diffusion_tq_batch_to_dataproto", lambda *args, **kwargs: data)
+    monkeypatch.setattr(trainer_base_module, "diffusion_dump_tq_fields", lambda batch_meta: [])
 
     trainer._log_rollout_data(SimpleNamespace(keys=["sample_0_0"], partition_id="train"), {}, "/tmp/unused")
 

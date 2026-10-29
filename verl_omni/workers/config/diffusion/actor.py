@@ -46,6 +46,15 @@ class DiffusionLossConfig(BaseConfig):
     dpo_beta: float = 2000.0
     kl_mask_threshold: float = 1e-5
     add_kl_coefficient: bool = True
+    dgpo_beta: float = 100.0
+    dgpo_clip_range: float = 0.01
+    awm_clip_range: float = 1e-4
+    awm_kl_coef: float = 0.1
+    # OmniNFT-only modality weights and reference regularization coefficients.
+    video_weight: float = 1.0
+    audio_weight: float = 1.0
+    video_ref_kl_coef: float = 0.0
+    audio_ref_kl_coef: float = 0.0
 
     def __post_init__(self):
         """Validate diffusion loss configuration."""
@@ -54,6 +63,9 @@ class DiffusionLossConfig(BaseConfig):
             "flow_dppo",
             "grpo_guard",
             "diffusion_nft",
+            "omni_nft",
+            "dgpo",
+            "awm",
             "dpo",
             "dmd2",
             "dance_grpo",
@@ -70,6 +82,14 @@ class DiffusionLossConfig(BaseConfig):
             raise ValueError(f"adaptive_weight_min must be positive, got {self.adaptive_weight_min}.")
         if self.kl_mask_threshold <= 0:
             raise ValueError(f"kl_mask_threshold must be positive, got {self.kl_mask_threshold}.")
+        if self.dgpo_beta <= 0:
+            raise ValueError(f"dgpo_beta must be positive, got {self.dgpo_beta}.")
+        if self.dgpo_clip_range < 0:
+            raise ValueError(f"dgpo_clip_range must be non-negative, got {self.dgpo_clip_range}.")
+        if self.awm_clip_range < 0:
+            raise ValueError(f"awm_clip_range must be non-negative, got {self.awm_clip_range}.")
+        if self.awm_kl_coef < 0:
+            raise ValueError(f"awm_kl_coef must be non-negative, got {self.awm_kl_coef}.")
 
 
 @dataclass

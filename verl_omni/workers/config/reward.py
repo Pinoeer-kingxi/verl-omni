@@ -20,9 +20,11 @@ from dataclasses import dataclass, field
 from math import isfinite
 from typing import Any
 
+import torch
 from omegaconf import OmegaConf
 from verl.base_config import BaseConfig
 from verl.utils.config import omega_conf_to_dataclass
+from verl.utils.device import get_device_name
 
 __all__ = [
     "EngineRewardModelConfig",
@@ -64,8 +66,16 @@ class StreamingRewardConfig(BaseConfig):
     max_inflight: int = 8
     # Per-sample deadline in seconds from the start of scoring; null disables it.
     timeout: float | None = None
+    # Optional generated fields sent to named groups; media fields are always retained. Null keeps all fields.
+    extra_fields: list[str] | None = None
 
     def __post_init__(self) -> None:
+        if self.extra_fields is not None and (
+            not isinstance(self.extra_fields, list)
+            or any(not isinstance(key, str) or not key for key in self.extra_fields)
+            or len(set(self.extra_fields)) != len(self.extra_fields)
+        ):
+            raise ValueError("reward.streaming.extra_fields must be a list of distinct non-empty strings or null")
         if not isinstance(self.enabled, bool):
             raise ValueError("reward.streaming.enabled must be a boolean")
         _validate_positive_int(self.max_inflight, "reward.streaming.max_inflight")
@@ -86,26 +96,60 @@ def get_streaming_reward_config(config) -> StreamingRewardConfig:
 
 @dataclass
 class RewardModelPlacementConfig(BaseConfig):
-    """Bundle indices in the trainer-selected parent resource pool."""
+    """Placement for one native reward replica deployment.
 
+    ``accelerator`` keeps the existing contract: ``devices`` are global logical
+    bundle indices in the trainer-selected parent resource pool.  ``cpu`` uses
+    ordinary Ray CPU actors counted by ``num_replicas``; no GPU parent pool is required.
+    """
+
+    # Global accelerator bundle indices in the trainer-selected parent pool.
     devices: list[int] = field(default_factory=list)
+    # Ray resource kind used to place complete native replicas.
+    resource: str = "accelerator"
+    # CPU capacity reserved for each CPU replica actor.
+    cpus_per_worker: int = 1
+    # Number of complete CPU replicas; accelerator replicas use devices.
+    num_replicas: int | None = None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.devices, list) or not self.devices:
+        if self.resource not in ("accelerator", "cpu"):
+            raise ValueError("Native reward model placement.resource must be 'accelerator' or 'cpu'")
+        if self.is_cpu:
+            if self.devices:
+                raise ValueError("CPU placement uses placement.num_replicas; remove placement.devices")
+            _validate_positive_int(self.num_replicas, "Native reward model placement.num_replicas")
+        elif self.num_replicas is not None:
+            raise ValueError("placement.num_replicas is only supported for resource='cpu'")
+        if not isinstance(self.devices, list) or (not self.is_cpu and not self.devices):
             raise ValueError("Native reward model placement.devices must be a non-empty list")
         if any(isinstance(device, bool) or not isinstance(device, int) or device < 0 for device in self.devices):
             raise ValueError("Native reward model placement.devices must contain non-negative integers")
         if len(set(self.devices)) != len(self.devices):
             raise ValueError("Native reward model placement.devices must not contain duplicates")
+        _validate_positive_int(self.cpus_per_worker, "Native reward model placement.cpus_per_worker")
+        if self.resource == "accelerator" and self.cpus_per_worker != 1:
+            raise ValueError("Native reward model placement.cpus_per_worker is only supported for resource='cpu'")
+
+    @property
+    def is_cpu(self) -> bool:
+        """Whether the deployment uses ordinary Ray CPU resources."""
+        return self.resource == "cpu"
 
     @classmethod
     def from_mapping(cls, name: str, value) -> RewardModelPlacementConfig:
         placement = to_mapping(value)
-        _reject_unknown_fields(name, placement, {"devices"}, prefix="placement.")
-        if "devices" not in placement:
-            raise ValueError(f"Native reward model {name!r} requires placement.devices as parent-pool bundle indices")
+        allowed = {"devices", "resource", "cpus_per_worker", "num_replicas"}
+        _reject_unknown_fields(name, placement, allowed, prefix="placement.")
+        if placement.get("resource", "accelerator") == "accelerator" and "devices" not in placement:
+            raise ValueError(f"Native reward model {name!r} requires placement.devices")
         try:
-            return cls(devices=placement["devices"])
+            return cls(
+                devices=placement.get("devices", []),
+                resource=placement.get("resource", "accelerator"),
+                cpus_per_worker=placement.get("cpus_per_worker", 1),
+                num_replicas=placement.get("num_replicas"),
+            )
         except (TypeError, ValueError) as exc:
             raise type(exc)(f"Native reward model {name!r} {exc}") from exc
 
@@ -264,6 +308,23 @@ class NativeRewardModelConfig(RewardModelConfig):
         if self.dispatch_batch_size is not None:
             _validate_positive_int(self.dispatch_batch_size, f"Native reward model {self.name!r} dispatch_batch_size")
 
+        if "device" in self.executor.kwargs:
+            configured_device = self.executor.kwargs["device"]
+            if not isinstance(configured_device, str | torch.device):
+                raise ValueError(
+                    f"Native reward model {self.name!r} executor.kwargs.device must be a device string or torch.device"
+                )
+            try:
+                device = torch.device(configured_device)
+            except (TypeError, RuntimeError, ValueError) as exc:
+                raise ValueError(f"Native reward model {self.name!r} executor.kwargs.device is invalid") from exc
+            expected_device_type = "cpu" if self.placement.is_cpu else get_device_name()
+            if device.type != expected_device_type or (device.type == "cpu" and not self.placement.is_cpu):
+                raise ValueError(
+                    f"Native reward model {self.name!r} executor.kwargs.device={str(device)!r} "
+                    f"conflicts with placement.resource={self.placement.resource!r}"
+                )
+
     @classmethod
     def from_mapping(cls, name: str, value) -> NativeRewardModelConfig:
         model = to_mapping(value)
@@ -289,6 +350,8 @@ class RewardModelSpec(BaseConfig):
     model_path: str | None = None
     router_address: str | None = None
     executor_config: dict[str, Any] = field(default_factory=dict)
+    # Worker-local executor device; accelerator selection is platform-specific.
+    device_type: str = "accelerator"
 
 
 def to_mapping(value) -> dict[str, Any]:
@@ -364,7 +427,16 @@ def reward_is_enabled(config) -> bool:
 
 def reward_role_required(config) -> bool:
     """Whether the reward loop needs the trainer-selected parent resource pool."""
-    return reward_is_enabled(config)
+    if config.reward.reward_model.get("enable", False) or has_engine_reward_models(config):
+        return True
+    for model in get_reward_model_entries(config).values():
+        if model.get("backend") != "native":
+            continue
+        placement = model.get("placement") or {}
+        resource = placement.get("resource", "accelerator")
+        if resource == "accelerator":
+            return True
+    return False
 
 
 def reward_pool_is_separate(config) -> bool:
@@ -381,8 +453,17 @@ def streaming_reward_enabled(config) -> bool:
         trainer = config.get("trainer", {})
         if not trainer.get("use_v1", False) or trainer.get("v1", {}).get("trainer_mode") != "sync":
             raise ValueError("Named reward streaming requires V1 synchronous diffusion training")
+        if config.get("algorithm", {}).get("trainer_type", "policy_gradient") != "policy_gradient":
+            raise ValueError("Named reward streaming requires algorithm.trainer_type=policy_gradient")
+        if config["reward"].get("aggregation", "weighted_sum") != "weighted_sum":
+            raise ValueError("Named reward streaming requires reward.aggregation=weighted_sum")
         if any(model.get("backend") != "native" for model in get_reward_model_entries(config).values()):
             raise ValueError("Named reward streaming currently supports only native reward models")
+        if any(
+            (model.get("placement") or {}).get("resource", "accelerator") != "accelerator"
+            for model in get_reward_model_entries(config).values()
+        ):
+            raise ValueError("Named reward streaming requires accelerator placement on every native model")
     if not reward_is_enabled(config):
         return True
     if has_reward_models(config):

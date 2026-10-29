@@ -23,7 +23,7 @@ dependencies = [
     "cachetools",
     "codetiming",
     "datasets>=2.20.0",
-    "diffusers>=0.40.0",
+    "diffusers>=0.41.0",
     "dill",
     "hydra-core",
     "imageio[ffmpeg]>=2.37.2",
@@ -45,6 +45,7 @@ dependencies = [
     "fastapi",
     "latex2sympy2_extended",
     "math_verify",
+    "mathruler",
     "tensorboard",
     "TransferQueue==0.1.9",
     "vllm==0.30.0",
@@ -74,6 +75,12 @@ gpu = [
     "kernels==0.16.0",
     "liger-kernel",
     "cupy-cuda13x",
+]
+xpu = [
+    # verl has no built-in Intel platform; the plugin registers it via the verl.plugins entry point.
+    "verl-hardware-plugin @ git+https://github.com/verl-project/verl-hardware-plugin.git@53c4de2626745543e45761711d4f6c265c508dc6",
+    # Ray counts Intel GPUs through dpctl; 0.22.x matches the oneAPI 2026 runtime of torch 2.13+xpu.
+    "dpctl>=0.22,<0.23",
 ]
 dev = [
     "pytest",
@@ -189,6 +196,7 @@ verl_omni = [
   "trainer/config/*.yaml",
   "trainer/config/*/*.yaml",
   "trainer/config/*/*/*.yaml",
+  "utils/agentic/*.json",
 ]
 
 # -------------------------------
@@ -197,6 +205,7 @@ verl_omni = [
 [tool.uv]
 override-dependencies = [
     "accelerate>=1.14.0",
+    "diffusers>=0.41.0",
     "kernels==0.16.0",
     "transformers>=5.13.0,<=5.14.1",
 ]

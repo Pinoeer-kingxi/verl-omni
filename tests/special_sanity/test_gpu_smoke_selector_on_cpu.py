@@ -44,6 +44,33 @@ def test_qwen3_tts_smoke_files_select_only_omni_e2e_group():
     assert selected == ["ci-e2e-omni"]
 
 
+def test_minicpmo_smoke_files_select_only_omni_e2e_group():
+    selector = _load_selector()
+
+    selected = selector.select_group_names(
+        [
+            "tests/special_e2e/build_minicpmo_tiny_random.py",
+            "tests/special_e2e/create_dummy_minicpmo_avqa_data.py",
+            "tests/special_e2e/run_gspo_minicpmo_thinker_lora_v1_smoke.sh",
+        ]
+    )
+
+    assert selected == ["ci-e2e-omni"]
+
+
+def test_minicpm_pipeline_changes_select_omni_e2e_group():
+    selector = _load_selector()
+
+    for path in (
+        "verl_omni/pipelines/minicpm/thinker_training_adapter.py",
+        "verl_omni/pipelines/minicpm/omni_rollout_adapter.py",
+        "verl_omni/pipelines/minicpm/media_inputs.py",
+        "verl_omni/pipelines/minicpm/prompt_parity.py",
+        "verl_omni/pipelines/minicpm/reward_decode.py",
+    ):
+        assert "ci-e2e-omni" in selector.select_group_names([path]), path
+
+
 def test_shared_omni_veomni_engine_and_adapters_select_omni_smoke():
     selector = _load_selector()
     for path in (
@@ -55,3 +82,14 @@ def test_shared_omni_veomni_engine_and_adapters_select_omni_smoke():
         "tests/pipelines/test_qwen3_omni_veomni_on_cpu.py",
     ):
         assert "ci-e2e-omni" in selector.select_group_names([path]), path
+
+
+def test_omni_e2e_runner_forwards_trainer_args_to_every_run_test():
+    # A run_test that drops the trainer args silently loses the configured
+    # rendezvous port range, so every launched command must forward them.
+    script = Path(__file__).parents[1] / "gpu_smoke/run_gpu_smoke_omni_e2e.sh"
+    blocks = script.read_text().split("run_test ")[1:]
+    assert blocks, "no run_test blocks found in the omni e2e runner"
+    for block in blocks:
+        commands = [line for line in block.splitlines() if not line.lstrip().startswith("#")]
+        assert any('"${omni_trainer_args[@]}"' in line for line in commands), block.splitlines()[0]

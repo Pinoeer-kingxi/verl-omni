@@ -41,10 +41,20 @@ from verl_omni.trainer.diffusion.ray_diffusion_trainer import (
     DirectPreferenceRayTrainer,
     PolicyGradientRayTrainer,
 )
-from verl_omni.utils.config import validate_config as validate_omni_config
+from verl_omni.utils.config import (
+    resolve_lora_config,
+)
+from verl_omni.utils.config import (
+    validate_config as validate_omni_config,
+)
 from verl_omni.utils.fs import resolve_model_local_dir
 from verl_omni.utils.rl_insight import enable_rl_insight
-from verl_omni.workers.config.reward import reward_pool_is_separate, reward_role_required, streaming_reward_enabled
+from verl_omni.workers.config.reward import (
+    get_streaming_reward_config,
+    reward_pool_is_separate,
+    reward_role_required,
+    streaming_reward_enabled,
+)
 
 __all__ = [
     "RayTrainerTaskRunner",
@@ -90,10 +100,7 @@ class RayTrainerTaskRunner:
         actor_rollout_cls = ActorRolloutRefWorker
         ray_worker_group_cls = RayWorkerGroup
 
-        lora_rank = config.actor_rollout_ref.model.get("lora", {}).get("rank", 0)
-        if lora_rank <= 0:
-            lora_rank = config.actor_rollout_ref.model.get("lora_rank", 0)
-        ref_in_actor = lora_rank > 0 or config.actor_rollout_ref.model.get("lora_adapter_path") is not None
+        ref_in_actor = resolve_lora_config(config.actor_rollout_ref.model).enabled
 
         if config.algorithm.sample_source == "offline":
             if not hasattr(Role, "Actor"):
@@ -335,6 +342,8 @@ def uses_v1_trainer(config) -> bool:
 def run_omni(config, task_runner_class=None) -> None:
     """Initialize Ray and run distributed Omni training."""
     streaming_reward_enabled(config)
+    if get_streaming_reward_config(config).enabled:
+        raise ValueError("Named reward streaming requires V1 synchronous diffusion training")
     enable_rl_insight(config)
 
     if uses_v1_trainer(config):

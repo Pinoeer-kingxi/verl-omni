@@ -8,6 +8,8 @@
 [![Docs](https://img.shields.io/badge/docs-Read%20the%20Docs-8A2BE2)](https://verl-omni.readthedocs.io/en/latest/index.html)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)](./LICENSE) <a href="docs/assets/WeChat.jpg"><img src="https://img.shields.io/badge/微信-green?logo=wechat"></a> <a href="https://join.slack.com/t/verl-project/shared_invite/zt-4bb32of1g-c~szeecZ2fufGeSadsIefw"><img src="https://img.shields.io/badge/Slack-verl-blueviolet?logo=slack"></a> <a href="https://drive.google.com/file/d/1EGVFZdvRgSBymMlZa62FObbzEhMoLA0F/view?usp=sharing"><img src="https://img.shields.io/badge/Slides-verl--omni-orange?logo=google-drive&logoColor=white"></a>
 
+[English](https://github.com/verl-project/verl-omni/blob/main/README.md) | [简体中文](https://github.com/verl-project/verl-omni/blob/main/README.zh.md)
+
 </div>
 
 `VeRL-Omni` is a general RL training framework focused on multimodal generative models, built on top of [`verl`](https://github.com/verl-project/verl).
@@ -15,6 +17,7 @@
 It originated from the multi-modal generation RL effort in `verl`, and now has a dedicated home so it can evolve in a more focused way.
 
 ## News 🔥
+- **[2026-08]** 🎉 We have released [v0.3.0](https://github.com/verl-project/verl-omni/releases/tag/v0.3.0) for fully async diffusion/omni rl with v1 trainer as default.
 - **[2026-09]** The [v1 trainer](docs/start/diffusion_v1.md) (TransferQueue + ReplayBuffer) is now the default for diffusion models; the legacy v0 trainer is deprecated, while offline DPO remains on v0 by design.
 - **[2026-08]** **[DiffusionOPD](docs/algo/diffusion_opd.md)** (on-policy distillation, including multi-teacher MOPD) is now supported.
 - **[2026-08]** 🔥 **MiniMax-H3** now supports T2VA, FL2VA, and Ref2VA with both [FlowGRPO](examples/flowgrpo_trainer/minimax_h3/README.md) and [DiffusionNFT](examples/diffusionnft_trainer/minimax_h3/README.md).
@@ -159,9 +162,9 @@ Visit our [documentation](https://verl-omni.readthedocs.io/en/latest/index.html)
     <td>✅</td>
   </tr>
   <tr>
-    <td rowspan="4">SD3.5</td>
-    <td rowspan="4">Diffusion generator</td>
-    <td rowspan="4">Text → Image</td>
+    <td rowspan="6">SD3.5</td>
+    <td rowspan="6">Diffusion generator</td>
+    <td rowspan="6">Text → Image</td>
     <td>DPO</td>
     <td>✅</td>
   </tr>
@@ -175,6 +178,14 @@ Visit our [documentation](https://verl-omni.readthedocs.io/en/latest/index.html)
   </tr>
   <tr>
     <td><a href="docs/algo/diffusion_opd.md">DiffusionOPD</a> (incl. MOPD)</td>
+    <td>✅</td>
+  </tr>
+  <tr>
+    <td><a href="docs/algo/dgpo.md">DGPO</a></td>
+    <td>✅</td>
+  </tr>
+  <tr>
+    <td><a href="examples/awm_trainer/README.md">AWM</a></td>
     <td>✅</td>
   </tr>
   <tr>
@@ -223,12 +234,12 @@ Visit our [documentation](https://verl-omni.readthedocs.io/en/latest/index.html)
 
 ## Ascend NPU Support 💠
 
-`VeRL-Omni` now supports Ascend NPU. For instructions on how to install and get started with FlowGRPO training on Ascend NPU, please refer to our [Ascend NPU Quickstart Guide](https://verl-omni.readthedocs.io/en/latest/start/flowgrpo_quickstart_npu.html).
+`VeRL-Omni` supports Ascend A2, A3, and A5 NPUs. See the [NPU installation guide](docs/start/install_npu.md) for setup and the [Ascend NPU Quickstart Guide](https://verl-omni.readthedocs.io/en/latest/start/flowgrpo_quickstart_npu.html) for FlowGRPO training.
 
 
 ## Roadmap 🗺
 
-Future work is tracked in [VeRL-Omni Q3 Roadmap](https://github.com/verl-project/verl-omni/issues/97)
+Future work is tracked in [VeRL-Omni Q4 Roadmap](https://github.com/verl-project/verl-omni/issues/700)
 
 ## Contributing 🤝
 

@@ -40,6 +40,7 @@ def main():
     parser.add_argument("--batch", action="store_true")
     parser.add_argument("--actor-offload", action="store_true")
     parser.add_argument("--agent-loop-manager")
+    parser.add_argument("overrides", nargs="*")
     args = parser.parse_args()
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
@@ -148,6 +149,7 @@ def main():
     ]
     if args.agent_loop_manager:
         overrides.append(f"+actor_rollout_ref.rollout.agent.agent_loop_manager_class={args.agent_loop_manager}")
+    overrides.extend(args.overrides)
     with initialize_config_dir(config_dir=str(config_dir), version_base=None):
         config = compose(config_name="diffusion_trainer", overrides=overrides)
     OmegaConf.save(config, output / "config.yaml")

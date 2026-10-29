@@ -1,6 +1,6 @@
 # Named Reward Models
 
-Last updated: 10/10/2026
+Last updated: 10/28/2026.
 
 This guide describes how to configure and extend named model-backed rewards
 under `reward.models` in `verl-omni`. For the general Reward Loop interface and
@@ -229,6 +229,27 @@ reward_functions:
     name: compute_semantic_quality
 ```
 
+### VLM-as-a-judge
+
+One judge model can serve several reward terms, each with its own `user_prompt`
+(literal text, or a `pkg://` builder). For UnifiedReward, literal text may contain
+`{caption}`, and a custom builder receives the caption. Leaving `user_prompt`
+unset keeps the scorer's default request.
+
+```yaml
+reward_functions:
+  ocr:
+    model: judge
+    path: pkg://verl_omni.utils.reward_score.genrm_ocr
+    name: compute_score_ocr
+    user_prompt: "Transcribe all text in the image exactly."
+  semantics:
+    model: judge
+    path: pkg://verl_omni.utils.reward_score.unified_reward
+    name: compute_score_unified_reward
+    user_prompt: pkg://my_package.prompts.build_semantic_prompt
+```
+
 Every term uses the existing aggregation contract:
 
 ```text
@@ -238,6 +259,22 @@ final_reward = sum(term.weight * term.score)
 `required=true` makes a scoring failure fatal. An optional term records the
 error and contributes zero. Model setup and lifecycle failures are always
 fatal.
+
+## Component rewards and consumer support
+
+`reward.aggregation` defaults to `weighted_sum`. Component mode requires
+`algorithm.trainer_type=direct_preference` and the registered `omni_nft` loss.
+The reward manager checks both at initialization, before reward workers start.
+The OmniNFT loss consumes the named components and applies modality routing.
+Online DPO, FlowGRPO, and ordinary DiffusionNFT do not support this layout.
+
+For a supporting consumer, component mode returns `rm_scores` with shape `[B, K]`.
+Columns follow the sorted reward-function names in `meta_info["reward_names"]`.
+Every term must have `required: true` and `weight: 1.0`; missing or non-finite
+components are rejected before actor update. Per-term `reward/<name>` metrics
+remain available. Summing the columns produces an unweighted diagnostic total,
+not a modality-weighted training objective. `routing_weights` is reserved for
+the companion OmniNFT consumer and is not forwarded to scorers.
 
 ## Use engine only
 
@@ -313,11 +350,119 @@ arguments are already present in `executor.kwargs`.
 
 Each native model entry is one deployment. Different checkpoints or lifecycle
 policies require different named deployments; multiple reward functions may
-share one deployment through their `model` field. In this PR, every
+share one deployment through their `model` field. For accelerator placement, every
 `placement.devices` entry creates one complete replica of that deployment.
 Future FSDP support will need an explicit replica-group schema because a flat
 device list cannot distinguish full replicas from ranks within one sharded
 replica.
+
+For native CLAP, AudioBox, and DeSync scorers, a single-sample `batch` supplies
+`audio`, `audio_sample_rate`, and optional `audio_layout` in preference to
+`extra_info`. Without `batch`, the scorers read `extra_info`.
+
+AudioBox and DeSync require an explicit positive integer source sample rate.
+Mono `(T,)` audio is accepted directly; two-dimensional audio requires
+`audio_layout: CT` in the scorer config or metadata and is interpreted as
+`(channels, samples)`. Channels-last `TC`, empty waveforms, and non-finite
+samples are rejected.
+
+CLAP preserves its existing defaults: an absent sample-rate key means 48 kHz,
+and two-dimensional audio is interpreted as `(channels, samples)` without a
+new config field. An explicit source sample rate still takes precedence, so
+24 kHz LTX and 32 kHz MiniMax audio are resampled from their actual rates.
+Existing CLAP recipes do not need an `audio_layout` setting. CLAP shares the
+empty/non-finite input checks, and accepts an explicit layout when supplied.
+
+HPSv3 and VideoAlign accept uint8 frames or finite floating-point frames in
+`[0, 1]`; values outside that range are rejected. HPSv3 applies the same pixel
+validation to interval and uniform sampling.
+
+### Configure native audio/video scorers
+
+Use `pkg://verl_omni.utils.reward_score.<module>` paths for the new AudioBox,
+DeSync, and VideoAlign scorers. Bind a native model through `model:` (or a
+matching model/term name) with `executor.model` set to `module:Class`:
+`audiobox:AudioBoxModel`, `desync:DeSyncModel`, or `videoalign:VideoAlignModel`,
+using the full `verl_omni.utils.reward_score` module prefix. DeSync additionally
+requires `source_root` in `executor.kwargs`; VideoAlign requires `base_model_path`.
+
+DeSync and VideoAlign require `fps` in each reward-function config. Set it to the
+actual generated frame rate, including fractional rates; there is no inferred
+or checkpoint-default FPS. For scorers that require a native `reward_model`,
+missing required arguments are configuration errors and fail before optional
+reward-error handling, even with `required: false`. If such a scorer also requires
+`fps`, the manager rejects null, boolean, non-numeric, non-finite, zero, and negative
+values before calling it. Positive fractional rates and numeric strings remain
+supported. Optional model inference failures still contribute zero and record an
+error; existing scorers retain their optional failure behavior.
+For example, with a configured native `desync` model:
+
+```yaml
+reward_functions:
+  desync:
+    path: pkg://verl_omni.utils.reward_score.desync
+    name: compute_score
+    model: desync
+    fps: 24.0  # Must match the generated video.
+    audio_layout: CT
+    required: true
+```
+
+VideoAlign requires a non-empty prompt from `ground_truth` or `prompt_key`.
+DeSync currently requires uint8 RGB `[T, C, H, W]` video. HPSv3 and VideoAlign
+also accept finite floating-point pixels in `[0, 1]`; this does not imply support
+for arbitrary layouts. Normalize decoded video to TCHW at the caller boundary.
+
+DeSync loads Python code from `source_root`, so use a **trusted checkout**. The
+reference OmniNFT revision is `fb9237f6e74edf0d0f2a683f4d975b79fde588fe`; record
+local modifications separately. Path checks do not authenticate source contents.
+The existing loader and AST compatibility lookup use the upstream package
+namespace; replacing only the entry-file import would not isolate that package.
+
+## Use native on CPU
+
+Small native reward executors can run as ordinary Ray CPU actors without
+allocating a trainer GPU pool. Set `placement.resource=cpu`, use
+`num_replicas` for the number of complete replicas, and reserve CPU capacity
+for each replica with `cpus_per_worker`:
+
+```yaml
+reward:
+  models:
+    quality:
+      backend: native
+      model_path: /models/quality
+      placement:
+        resource: cpu
+        num_replicas: 2
+        cpus_per_worker: 2
+      executor:
+        model: my_package.reward_model:CpuRewardModel
+  reward_functions:
+    quality:
+      path: pkg://my_package.reward_score
+      name: compute_quality_score
+```
+
+CPU native executors default to `torch.device("cpu")`. An explicit
+`executor.kwargs.device` must use CPU for CPU placement, or the current
+accelerator type for accelerator placement. A mismatch is rejected before
+workers are created. `placement.devices` is reserved for accelerator bundle
+indices; CPU placement requires a positive `num_replicas`. CPU deployments do not consume or split
+the trainer-selected accelerator reward pool, so they can be used alone or
+alongside engine and accelerator-native deployments.
+
+Each scoring phase wakes its worker-local models and, when `offload=true`,
+unloads them after all accepted scoring calls finish. A scoring failure or
+caller cancellation also waits for accepted calls before unloading. This wait
+has no timeout: a scoring RPC that never returns can block cleanup. CPU
+placement does not add forced worker termination or automatic retries.
+
+With `offload=false`, models remain resident. If a CPU deployment explicitly enables
+Ray actor restarts, the next scoring phase initializes a restarted actor again.
+Production worker creation does not enable automatic restarts. Accelerator
+deployments with `offload=false` skip repeated wake-ups and do not provide this
+restart recovery.
 
 ### Wrap a Transformers model for native mode
 
@@ -485,6 +630,7 @@ reward:
     enabled: true
     max_inflight: 8
     timeout: null
+    extra_fields: null
   reward_model:
     enable_resource_pool: true
   models:
@@ -493,13 +639,32 @@ reward:
       offload: false
 ```
 
-All named models must use the native backend, `offload: false`, and a dedicated
-reward resource pool. Other trainers, engine-backed rewards, and shared pools
+This path supports V1 synchronous policy-gradient training with scalar
+`weighted_sum` rewards. All named models must use the native backend,
+`offload: false`, accelerator placement, and a dedicated reward resource pool.
+CPU placement, direct-preference and component-reward modes, other trainers,
+engine-backed rewards, and shared pools
 are rejected before worker allocation. Models are woken when the reward manager
 starts and remain resident. Native and function-only groups use their existing
-workers and scorers; weights, raw term diagnostics,
-and `required` failure handling are unchanged. The group merge is shared with
+workers and scorers through the [async reward interface](async_reward.md#how-it-plugs-in).
+Each sample uses one replica per group and the existing batch dispatcher;
+weights, raw term diagnostics, and `required` failure handling are unchanged.
+The group merge is shared with
 batch scoring. The trainer still collects a full scored batch before updating.
+
+`streaming.extra_fields` selects optional generated `tool_extra_fields` sent to
+every named reward group. The default `null` forwards all fields. Named media
+tensors, declarations, selectors and context, plus legacy media metadata, are
+always retained. `[]` excludes training-only trajectory and embedding fields;
+include any such fields required by a configured scorer. Dataset `extra_info`,
+responses and the original training trajectory are preserved. This selection
+applies only to named streaming. Media contract errors remain fatal, including
+for optional rewards; see the [media contract](../advanced/diffusion_media_artifacts.md).
+
+Streaming is disabled by default. Early scoring may hide reward latency, but
+smaller inference batches can reduce GPU utilization. Keep the batch path unless
+a matched full-step comparison shows a benefit for the workload. Shared-GPU
+contention is outside this dedicated-pool scope.
 
 `max_inflight` bounds samples generating or scoring **per agent worker**,
 including canceled requests that are draining. Admission happens before
@@ -576,7 +741,6 @@ workload benefits.
 - Named-model aggregation currently uses the visual input contract implemented
   by `MultiVisualRewardManager`; the aggregation core itself is modality-neutral.
 - Native models are replicated; FSDP and tensor parallelism are not supported.
-- CPU-native placement is not supported.
 - Native routing defaults to a static even split; optional microbatch dispatch
   balances available work, without preempting or stealing an active batch.
 - Named-model streaming supports V1 synchronous diffusion training with dedicated,

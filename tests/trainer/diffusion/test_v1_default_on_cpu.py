@@ -75,10 +75,15 @@ def test_offline_dpo_v0_launch_stays_silent():
     assert config.trainer.use_v1 is False
 
 
-def test_run_diffusion_v1_force_enables_transfer_queue_before_ray_init(monkeypatch):
+@pytest.mark.parametrize(
+    "overrides",
+    [[], ["+ray_kwargs.ray_init.runtime_env.env_vars.OMP_NUM_THREADS='8'"]],
+    ids=["default", "user_env_vars"],
+)
+def test_run_diffusion_v1_force_enables_transfer_queue_before_ray_init(monkeypatch, overrides):
     import verl_omni.trainer.main_diffusion_v1 as main_v1
 
-    config = compose_diffusion_config()
+    config = compose_diffusion_config(overrides)
     assert config.transfer_queue.enable is False
 
     captured = {}
@@ -110,3 +115,5 @@ def test_run_diffusion_v1_force_enables_transfer_queue_before_ray_init(monkeypat
     assert config.transfer_queue.enable is True
     env_vars = captured["runtime_env"]["env_vars"]
     assert env_vars.get("TRANSFER_QUEUE_ENABLE") == "1"
+    if overrides:
+        assert env_vars.get("OMP_NUM_THREADS") == "8"

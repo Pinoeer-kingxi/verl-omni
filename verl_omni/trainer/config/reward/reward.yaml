@@ -26,6 +26,9 @@ streaming:
   # Per-sample deadline in seconds from the start of scoring; null disables it.
   timeout: null
 
+  # Optional generated fields sent to named groups; media fields are always retained. Null keeps all.
+  extra_fields: null
+
 # custom reward function definition
 custom_reward_function:
   # The path to the file containing your customized reward function.
@@ -44,14 +47,14 @@ accelerator_workers:
 
 # Multi-reward configuration (dict-based, mutually exclusive with custom_reward_function).
 # Keys are user-chosen names used for metric logging (e.g., "ocr", "jpeg").
-# Each entry: path (str), name (str), weight (float).
+# Each entry uses path/name/weight; preserve_components requires required=true and ignores weight.
 reward_functions: {}
 
 # Named reward models. See docs/algo/named_reward_models.md for configuration
 # and extension instructions.
 models: {}
 
-# Aggregation method for multi-reward. Only "weighted_sum" is supported.
+# Aggregation method for multi-reward: "weighted_sum" or "preserve_components".
 aggregation: weighted_sum
 
 # reward manager configuration

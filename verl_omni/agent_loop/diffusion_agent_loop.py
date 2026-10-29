@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
-import random
 from contextlib import nullcontext
 from typing import Any, Optional
 
@@ -35,7 +34,7 @@ from verl.workers.rollout.llm_server import LLMServerClient
 
 from verl_omni.agent_loop.utils import maybe_per_rollout_seeds
 from verl_omni.reward_loop.reward_model_executor import _await_owned
-from verl_omni.reward_loop.streaming import StreamingRewardClient
+from verl_omni.reward_loop.streaming import create_async_reward_client
 from verl_omni.workers.config import DiffusionModelConfig, DiffusionRolloutConfig
 from verl_omni.workers.config.reward import get_streaming_reward_config
 
@@ -166,11 +165,9 @@ class DiffusionAgentLoopWorker:
 
         self.dataset_cls = get_dataset_class(config.data)
         self.reward_loop_worker_handles = reward_loop_worker_handles
-        self.streaming_reward_client = None
-        if isinstance(reward_loop_worker_handles, dict):
-            self.streaming_reward_client = StreamingRewardClient(
-                reward_loop_worker_handles, get_streaming_reward_config(config)
-            )
+        self.async_reward_client = create_async_reward_client(
+            reward_loop_worker_handles, get_streaming_reward_config(config)
+        )
 
         self.tokenizer = self.model_config.tokenizer
         self.processor = self.model_config.processor
@@ -197,8 +194,8 @@ class DiffusionAgentLoopWorker:
 
     async def close_reward_streaming(self) -> None:
         """Stop reward admission and drain before the owner closes reward models."""
-        if self.streaming_reward_client is not None:
-            await self.streaming_reward_client.close()
+        if self.async_reward_client is not None:
+            await self.async_reward_client.close()
 
     async def generate_sequences(self, batch: DataProto) -> DataProto:
         """Generate sequences from agent loop.
@@ -261,7 +258,7 @@ class DiffusionAgentLoopWorker:
         try:
             outputs = await asyncio.gather(*tasks)
         except BaseException:
-            if isinstance(self.reward_loop_worker_handles, dict):
+            if self.async_reward_client is not None and self.async_reward_client.requires_drain:
                 for task in tasks:
                     task.cancel()
                 await _await_owned(asyncio.gather(*tasks, return_exceptions=True))
@@ -295,7 +292,7 @@ class DiffusionAgentLoopWorker:
             hf_model_type=self.hf_model_type,
             extra_tokenizer_map=self.model_config.extra_tokenizer_map,
         )
-        admission = self.streaming_reward_client.sample_slot() if self.streaming_reward_client else nullcontext()
+        admission = self.async_reward_client.sample_slot() if self.async_reward_client else nullcontext()
         async with admission:
             output: DiffusionAgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
             return await self._agent_loop_postprocess(output, validate=validate, **kwargs)
@@ -358,9 +355,7 @@ class DiffusionAgentLoopWorker:
 
     async def _compute_score(self, output, prompts, responses, kwargs, validate: bool = False):
         """Compute reward score for single sample."""
-        enable_async_reward = self.reward_loop_worker_handles is not None
-
-        if output.reward_score is None and enable_async_reward:
+        if output.reward_score is None and self.async_reward_client is not None:
             timing = {}
             with simple_timer("compute_score", timing):
                 batch = TensorDict(
@@ -381,11 +376,7 @@ class DiffusionAgentLoopWorker:
                     non_tensor_batch=non_tensor_batch,
                     meta_info={"validate": validate},
                 )
-                if isinstance(self.reward_loop_worker_handles, dict):
-                    result = await self.streaming_reward_client.compute_admitted_score(data)
-                else:
-                    selected_reward_loop_worker_handle = random.choice(self.reward_loop_worker_handles)
-                    result = await selected_reward_loop_worker_handle.compute_score.remote(data)
+                result = await self.async_reward_client.compute_score(data)
                 output.reward_score = result["reward_score"]
                 output.extra_fields["reward_extra_info"] = result["reward_extra_info"]
             output.metrics.compute_score = timing["compute_score"]

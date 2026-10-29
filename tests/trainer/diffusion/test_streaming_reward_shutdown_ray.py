@@ -14,16 +14,19 @@
 """Real-Ray regressions for failed shutdown and late prompt registration."""
 
 import asyncio
+import tempfile
 from types import SimpleNamespace
 
 import pytest
 import ray
+import torch
 import transfer_queue as tq
 from omegaconf import OmegaConf
 from tensordict import NonTensorData, TensorDict
+from verl.protocol import DataProto
 
 from verl_omni.agent_loop.diffusion_agent_loop_tq import DiffusionAgentLoopManagerTQ, DiffusionAgentLoopWorkerTQ
-from verl_omni.reward_loop.streaming import StreamingRewardClient
+from verl_omni.reward_loop.streaming import create_async_reward_client
 from verl_omni.trainer.main_diffusion_v1 import DiffusionTaskRunnerV1
 from verl_omni.workers.config.reward import StreamingRewardConfig
 
@@ -36,7 +39,7 @@ class GatedAgent(DiffusionAgentLoopWorkerTQ.__ray_metadata__.modified_class):
         self.rollout_config = OmegaConf.create(
             {"pipeline": {}, "algo": {}, "calculate_log_probs": False, "agent": {"default_agent_loop": "test"}}
         )
-        self.streaming_reward_client = StreamingRewardClient({}, StreamingRewardConfig())
+        self.async_reward_client = create_async_reward_client({}, StreamingRewardConfig())
         self.background_tasks = set()
         self.gate = asyncio.Event()
         self.prompt_gate = asyncio.Event()
@@ -105,18 +108,77 @@ class FailingAgent:
         return self.failed
 
 
+@ray.remote(num_cpus=0)
+class GatedReward:
+    """Keep an accepted batch RPC running until explicitly released."""
+
+    def __init__(self):
+        self.gate = asyncio.Event()
+        self.started = False
+        self.finished = False
+
+    async def compute_score_batch(self, data):
+        """Return one score per sample after the gate opens."""
+        self.started = True
+        await self.gate.wait()
+        self.finished = True
+        return [{"reward_score": float(data.batch["responses"].item())}]
+
+    async def state(self):
+        """Read RPC progress without releasing it."""
+        return self.started, self.finished
+
+    async def release(self):
+        """Allow the accepted RPC to settle."""
+        self.gate.set()
+
+
 @pytest.fixture(scope="module", autouse=True)
 def cluster():
-    ray.init(
-        address="local",
-        num_cpus=2,
-        num_gpus=0,
-        include_dashboard=False,
-        _temp_dir="/tmp/vosr-acceptance",
-        object_store_memory=128 * 1024 * 1024,
-    )
-    yield
-    ray.shutdown()
+    with tempfile.TemporaryDirectory(prefix="vosr-") as temp_dir:
+        ray.init(
+            address="local",
+            num_cpus=2,
+            num_gpus=0,
+            include_dashboard=False,
+            _temp_dir=temp_dir,
+            object_store_memory=128 * 1024 * 1024,
+        )
+        try:
+            yield
+        finally:
+            ray.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_real_ray_batch_scoring_keeps_ownership_after_cancellation():
+    worker = GatedReward.remote()
+    client = create_async_reward_client({"quality": (worker,)}, StreamingRewardConfig(max_inflight=1))
+
+    async def score():
+        async with client.sample_slot():
+            return await client.compute_score(DataProto.from_dict(tensors={"responses": torch.tensor([[2]])}))
+
+    task = asyncio.create_task(score())
+    close = None
+    try:
+        async with asyncio.timeout(30):
+            while not (await worker.state.remote())[0]:
+                await asyncio.sleep(0.01)
+            task.cancel()
+            close = asyncio.create_task(client.close())
+            await asyncio.sleep(0)
+            assert not task.done() and not close.done()
+            assert await worker.state.remote() == (True, False)
+            await worker.release.remote()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            await close
+            assert await worker.state.remote() == (True, True)
+    finally:
+        await worker.release.remote()
+        await asyncio.gather(task, *([close] if close is not None else []), return_exceptions=True)
+        ray.kill(worker)
 
 
 @pytest.mark.asyncio

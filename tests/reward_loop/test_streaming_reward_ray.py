@@ -19,6 +19,7 @@ Run this file explicitly; it starts a Ray cluster and uses native GPU actors.
 
 import asyncio
 import os
+import tempfile
 from types import SimpleNamespace
 
 import numpy as np
@@ -29,8 +30,9 @@ from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf
 from verl.protocol import DataProto
 
+from verl_omni.pipelines.rollout_media import MediaArtifact, MediaSpec, artifact_fields
 from verl_omni.reward_loop.reward_loop import OmniRewardLoopWorker
-from verl_omni.reward_loop.streaming import StreamingRewardClient
+from verl_omni.reward_loop.streaming import create_async_reward_client
 from verl_omni.workers.config.reward import RewardModelSpec, StreamingRewardConfig
 
 
@@ -81,15 +83,19 @@ class ObservableWorker(OmniRewardLoopWorker):
 
 @pytest.fixture(scope="module", autouse=True)
 def cluster():
-    ray.init(
-        num_cpus=6,
-        num_gpus=1,
-        include_dashboard=False,
-        _temp_dir="/tmp/vosray",
-        object_store_memory=256 * 1024 * 1024,
-    )
-    yield
-    ray.shutdown()
+    with tempfile.TemporaryDirectory(prefix="vosray-") as temp_dir:
+        ray.init(
+            address="local",
+            num_cpus=2,
+            num_gpus=1,
+            include_dashboard=False,
+            _temp_dir=temp_dir,
+            object_store_memory=256 * 1024 * 1024,
+        )
+        try:
+            yield
+        finally:
+            ray.shutdown()
 
 
 def _worker(key, *, weight=1.0, scale=1.0, delay=0.0, fail=False, required=True):
@@ -102,7 +108,7 @@ def _worker(key, *, weight=1.0, scale=1.0, delay=0.0, fail=False, required=True)
         {
             key: {
                 "model": "linear",
-                "path": "pkg://test_streaming_reward_ray",
+                "path": "pkg://tests.reward_loop.test_streaming_reward_ray",
                 "name": "linear_score",
                 "weight": weight,
                 "delay": delay,
@@ -115,7 +121,7 @@ def _worker(key, *, weight=1.0, scale=1.0, delay=0.0, fail=False, required=True)
         name="linear",
         backend="native",
         executor_config={
-            "model": "test_streaming_reward_ray:LinearModel",
+            "model": "tests.reward_loop.test_streaming_reward_ray:LinearModel",
             "kwargs": {"scale": scale},
         },
     )
@@ -125,14 +131,24 @@ def _worker(key, *, weight=1.0, scale=1.0, delay=0.0, fail=False, required=True)
 
 
 def _sample(value):
+    image = torch.full((3, 4, 4), value, dtype=torch.uint8)
+    fields = artifact_fields(
+        {"image_preview": MediaArtifact(MediaSpec("image", "decoded", "CHW"), image)}, "image_preview", "image_preview"
+    )
     return DataProto.from_dict(
-        tensors={"responses": torch.full((1, 3, 4, 4), value, dtype=torch.uint8)},
+        tensors={"responses": image.unsqueeze(0)},
         non_tensors={
             "data_source": np.array(["real_ray"]),
             "reward_model": np.array([{"ground_truth": "test"}], dtype=object),
             "extra_info": np.array([{}], dtype=object),
+            "tool_extra_fields": np.array([fields], dtype=object),
         },
     )
+
+
+async def _score_sample(client, data):
+    async with client.sample_slot():
+        return await client.compute_score(data)
 
 
 @pytest.mark.asyncio
@@ -140,8 +156,8 @@ async def test_real_ray_fanout_weighting_order_and_close():
     a = _worker("a", weight=0.7, scale=2.0, delay=0.01)
     b = _worker("b", weight=0.3, scale=3.0)
     try:
-        client = StreamingRewardClient({"a": (a,), "b": (b,)}, StreamingRewardConfig(max_inflight=2))
-        results = await asyncio.gather(*(client.compute_score(_sample(i)) for i in range(1, 7)))
+        client = create_async_reward_client({"a": (a,), "b": (b,)}, StreamingRewardConfig(max_inflight=2))
+        results = await asyncio.gather(*(_score_sample(client, _sample(i)) for i in range(1, 7)))
         assert [item["reward_score"] for item in results] == pytest.approx([2.3 * i for i in range(1, 7)])
         for i, item in enumerate(results, 1):
             assert item["reward_extra_info"]["reward/a"] == 2 * i
@@ -153,6 +169,23 @@ async def test_real_ray_fanout_weighting_order_and_close():
     finally:
         ray.kill(a)
         ray.kill(b)
+
+
+@pytest.mark.asyncio
+async def test_real_ray_projection_preserves_media_and_fatal_contract_errors():
+    worker = _worker("optional", required=False)
+    client = create_async_reward_client({"optional": (worker,)}, StreamingRewardConfig(extra_fields=[]))
+    try:
+        assert (await _score_sample(client, _sample(2)))["reward_score"] == 2
+        invalid = _sample(3)
+        invalid.batch["responses"] = invalid.batch["responses"] + 1
+        with pytest.raises(ray.exceptions.RayTaskError, match="responses projection"):
+            await _score_sample(client, invalid)
+        assert (await worker.stats.remote())["calls"] == [2]
+        await client.close()
+        await worker.close_reward_model.remote()
+    finally:
+        ray.kill(worker)
 
 
 @pytest.mark.parametrize("kind", ["cancel", "timeout", "required", "optional", "worker_death", "submission"])
@@ -172,12 +205,12 @@ async def test_real_ray_failure_paths_drain_before_model_close(kind):
             def reject(data):
                 raise RuntimeError("submission failed")
 
-            other = SimpleNamespace(compute_score=SimpleNamespace(remote=reject))
-        client = StreamingRewardClient(
+            other = SimpleNamespace(compute_score_batch=SimpleNamespace(remote=reject))
+        client = create_async_reward_client(
             {"slow": (a,), "other": (other,)},
             StreamingRewardConfig(max_inflight=1, timeout=0.02 if kind == "timeout" else None),
         )
-        task = asyncio.create_task(client.compute_score(_sample(2)))
+        task = asyncio.create_task(_score_sample(client, _sample(2)))
         while not (await a.stats.remote())["calls"]:
             await asyncio.sleep(0.001)
         if kind == "cancel":

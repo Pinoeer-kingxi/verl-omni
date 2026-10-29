@@ -37,9 +37,16 @@ from verl_omni.agent_loop.diffusion_agent_loop_tq import (
     create_diffusion_agent_loop_manager,
 )
 from verl_omni.agent_loop.single_turn_agent_loop import DiffusionSingleTurnAgentLoop
-from verl_omni.reward_loop.streaming import StreamingRewardClient
+from verl_omni.reward_loop.streaming import create_async_reward_client
 from verl_omni.trainer.diffusion.v1 import tq_utils
 from verl_omni.workers.config.reward import StreamingRewardConfig
+
+
+def _batch_reward_handle(score):
+    async def batch(data):
+        return [await score(data)]
+
+    return SimpleNamespace(compute_score_batch=SimpleNamespace(remote=lambda d: asyncio.create_task(batch(d))))
 
 
 class _FakeRemoteComputeScore:
@@ -77,6 +84,7 @@ class _DummyDiffusionAgentLoopWorker:
 
     def __init__(self, reward_loop_worker_handle: _FakeRewardLoopWorkerHandle):
         self.reward_loop_worker_handles = [reward_loop_worker_handle]
+        self.async_reward_client = create_async_reward_client(self.reward_loop_worker_handles, StreamingRewardConfig())
 
 
 @pytest.mark.parametrize(
@@ -133,6 +141,7 @@ async def test_single_turn_agent_forwards_all_multimodal_inputs():
     agent_loop.server_manager = SimpleNamespace(
         generate=AsyncMock(
             return_value=SimpleNamespace(
+                artifacts={},
                 diffusion_output=torch.zeros(1),
                 log_probs=None,
                 num_preempted=None,
@@ -309,6 +318,56 @@ async def test_tq_writer_preserves_allowlisted_non_tensor_trajectory_metadata(mo
     assert field["condition_image_latents"].shape == (4096, 64)
     assert field["audio"].shape == (1, 16)
     assert captured["tags"][0]["response_shape"] == (3, 2, 2)
+
+
+@pytest.mark.asyncio
+async def test_run_prompt_batches_prompt_group_into_one_put(monkeypatch):
+    """All of a prompt's session rows must land in a single batched TQ put."""
+    worker_cls = DiffusionAgentLoopWorkerTQ.__ray_metadata__.modified_class
+    worker = object.__new__(worker_cls)
+    worker.rollout_config = SimpleNamespace(n=2, val_kwargs=SimpleNamespace(n=2))
+
+    def make_output(*, with_log_probs: bool):
+        return SimpleNamespace(
+            prompt_ids=torch.tensor([[1, 2]]),
+            response_diffusion_output=torch.zeros(1, 3, 2, 2),
+            response_logprobs=torch.zeros(1, 4) if with_log_probs else None,
+            reward_score=0.5,
+            num_turns=1,
+            extra_fields={"media_kind": "image"},
+        )
+
+    captured = {}
+
+    async def fake_run_agent_loop(self, sampling_params, *, session_id, **kwargs):
+        del self, sampling_params, kwargs
+        return make_output(with_log_probs=True)
+
+    async def fake_kv_batch_put(*, keys, fields, tags, partition_id):
+        captured.update(keys=keys, fields=fields, tags=tags, partition_id=partition_id)
+
+    async def fake_kv_put(*, key, partition_id, tag):
+        del key, partition_id, tag
+
+    worker._run_agent_loop = MethodType(fake_run_agent_loop, worker)
+    monkeypatch.setattr(diffusion_agent_loop_tq.tq, "async_kv_batch_put", fake_kv_batch_put)
+    monkeypatch.setattr(diffusion_agent_loop_tq.tq, "async_kv_put", fake_kv_put)
+
+    await worker._run_prompt(
+        prompt={"uid": "sample", "agent_name": "diffusion_single_turn_agent"},
+        sampling_params={"global_steps": 3},
+        trajectory={"validate": False, "step": 3},
+        prompt_index=0,
+    )
+
+    assert captured["keys"] == ["sample_0_0", "sample_1_0"]
+    assert captured["partition_id"] == "train"
+    assert len(captured["tags"]) == 2
+    assert all(tag["status"] == "success" for tag in captured["tags"])
+    # One batched put call: the real list_of_dict_to_tensordict stacks the rows.
+    assert captured["fields"].batch_size == (2,)
+    assert "rollout_log_probs" in captured["fields"].keys()
+    assert "rm_scores" in captured["fields"].keys()
 
 
 @pytest.mark.asyncio
@@ -507,7 +566,67 @@ async def test_async_reward_data_proto_preserves_validate_meta_info(validate: bo
 
 
 @pytest.mark.asyncio
-async def test_named_reward_admission_bounds_generation_and_overlaps_scoring(monkeypatch):
+@pytest.mark.parametrize("precomputed", [False, True])
+async def test_agent_skips_scoring_without_handles_or_with_precomputed_reward(precomputed):
+    handle = _FakeRewardLoopWorkerHandle()
+    worker = _DummyDiffusionAgentLoopWorker(handle)
+    if not precomputed:
+        worker.async_reward_client = None
+    output = DiffusionAgentLoopOutput(
+        prompt_ids=[1, 2],
+        response_diffusion_output=torch.zeros(3, 2, 2, dtype=torch.uint8),
+        reward_score=2.0 if precomputed else None,
+        metrics=AgentLoopMetrics(),
+    )
+    await worker._compute_score(
+        output,
+        prompts=torch.tensor([[1, 2]]),
+        responses=torch.zeros(1, 3, 2, 2, dtype=torch.uint8),
+        kwargs={},
+    )
+    assert handle.compute_score.received_data is None
+    assert output.reward_score == (2.0 if precomputed else None)
+
+
+@pytest.mark.asyncio
+async def test_composite_constructor_retains_combined_reward_handle(monkeypatch):
+    from omegaconf import OmegaConf
+
+    from verl_omni.agent_loop.composite_agent_loop import CompositeAgentLoopWorker
+
+    config = OmegaConf.create(
+        {
+            "actor_rollout_ref": {
+                "rollout": {"max_prompt_embed_length": 2, "agent": {"agent_loop_config_path": None}},
+                "model": {"tokenizer": None, "processor": None, "hf_config": {}},
+            },
+            "data": {},
+            "reward": {"reward_functions": {"ar": {"weight": 0}}},
+        }
+    )
+    monkeypatch.setattr("verl_omni.agent_loop.diffusion_agent_loop.omega_conf_to_dataclass", lambda value: value)
+    monkeypatch.setattr("verl_omni.agent_loop.diffusion_agent_loop.get_dataset_class", lambda _: None)
+    handle = _FakeRewardLoopWorkerHandle()
+    worker = CompositeAgentLoopWorker(config, None, reward_loop_worker_handles=[handle])
+    assert worker.reward_loop_worker_handles == [handle]
+    output = DiffusionAgentLoopOutput(
+        prompt_ids=[1, 2],
+        response_diffusion_output=torch.zeros(3, 2, 2, dtype=torch.uint8),
+        metrics=AgentLoopMetrics(),
+    )
+    await worker._compute_score(
+        output,
+        prompts=torch.tensor([[1, 2]]),
+        responses=torch.zeros(1, 3, 2, 2, dtype=torch.uint8),
+        kwargs={},
+    )
+    assert output.reward_score == 1.0
+    assert handle.compute_score.received_data is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("max_inflight", [1, 2])
+async def test_named_reward_admission_bounds_generation_and_overlaps_scoring(monkeypatch, max_inflight):
     slow_started = asyncio.Event()
     release_slow = asyncio.Event()
     fast_scoring = asyncio.Event()
@@ -520,7 +639,7 @@ async def test_named_reward_admission_bounds_generation_and_overlaps_scoring(mon
         if uid == "slow":
             slow_started.set()
             await release_slow.wait()
-        else:
+        elif max_inflight == 2:
             await slow_started.wait()
         return DiffusionAgentLoopOutput(
             prompt_ids=[1, 2],
@@ -536,9 +655,7 @@ async def test_named_reward_admission_bounds_generation_and_overlaps_scoring(mon
             await release_fast_score.wait()
         return {"reward_score": 1.0, "reward_extra_info": {"reward/quality": 1.0}}
 
-    handles = {
-        "quality": (SimpleNamespace(compute_score=SimpleNamespace(remote=lambda d: asyncio.create_task(score(d)))),)
-    }
+    handles = {"quality": (_batch_reward_handle(score),)}
     worker = object.__new__(DiffusionAgentLoopWorker)
     worker.config = SimpleNamespace(data={})
     worker.server_manager = worker.processor = worker.dataset_cls = worker.hf_model_type = None
@@ -548,7 +665,7 @@ async def test_named_reward_admission_bounds_generation_and_overlaps_scoring(mon
         pad=lambda *args, **kwargs: {"input_ids": torch.tensor([1, 2]), "attention_mask": torch.ones(2)}
     )
     worker.reward_loop_worker_handles = handles
-    worker.streaming_reward_client = StreamingRewardClient(handles, StreamingRewardConfig(max_inflight=2))
+    worker.async_reward_client = create_async_reward_client(handles, StreamingRewardConfig(max_inflight=max_inflight))
     monkeypatch.setattr(
         "verl_omni.agent_loop.diffusion_agent_loop.hydra.utils.instantiate",
         lambda **kwargs: SimpleNamespace(run=generate),
@@ -562,17 +679,21 @@ async def test_named_reward_admission_bounds_generation_and_overlaps_scoring(mon
     try:
         async with asyncio.timeout(5):
             await fast_scoring.wait()
-            assert generated == ["fast", "slow"]
+            assert generated == ["fast", "slow"][:max_inflight]
             assert not queued.done()
             release_fast_score.set()
             assert (await fast).reward_score == 1.0
-            assert slow_started.is_set() and not slow.done()
+            await slow_started.wait()
+            assert not slow.done()
+            if max_inflight == 1:
+                release_slow.set()
+                assert (await slow).reward_score == 1.0
             assert (await queued).reward_score == 1.0
             assert generated == ["fast", "slow", "queued"]
-            assert scored == ["fast", "queued"]
+            assert scored == (["fast", "queued"] if max_inflight == 2 else ["fast", "slow", "queued"])
             release_slow.set()
             assert (await slow).reward_score == 1.0
-            assert scored == ["fast", "queued", "slow"]
+            assert sorted(scored) == ["fast", "queued", "slow"]
     finally:
         release_fast_score.set()
         release_slow.set()
@@ -595,12 +716,10 @@ async def test_named_reward_agent_publishes_only_live_results(exit_kind):
         await release.wait()
         return {"reward_score": 2.0, "reward_extra_info": {"reward/quality": 2.0}}
 
-    handles = {
-        "quality": (SimpleNamespace(compute_score=SimpleNamespace(remote=lambda d: asyncio.create_task(score(d)))),)
-    }
+    handles = {"quality": (_batch_reward_handle(score),)}
     worker = object.__new__(DiffusionAgentLoopWorker)
     worker.reward_loop_worker_handles = handles
-    worker.streaming_reward_client = StreamingRewardClient(
+    worker.async_reward_client = create_async_reward_client(
         handles, StreamingRewardConfig(timeout=0.02 if exit_kind == "timeout" else None)
     )
     output = DiffusionAgentLoopOutput(
@@ -610,7 +729,7 @@ async def test_named_reward_agent_publishes_only_live_results(exit_kind):
     )
 
     async def run():
-        async with worker.streaming_reward_client.sample_slot():
+        async with worker.async_reward_client.sample_slot():
             await worker._compute_score(
                 output,
                 prompts=torch.tensor([[1, 2]]),
@@ -655,15 +774,14 @@ async def test_tq_close_cancels_prompts_and_drains_accepted_reward():
         finished.set()
         return {"reward_score": 1.0, "reward_extra_info": {}}
 
-    handles = {
-        "quality": (SimpleNamespace(compute_score=SimpleNamespace(remote=lambda d: asyncio.create_task(score(d)))),)
-    }
+    handles = {"quality": (_batch_reward_handle(score),)}
     worker = object.__new__(DiffusionAgentLoopWorkerTQ.__ray_metadata__.modified_class)
-    worker.streaming_reward_client = StreamingRewardClient(handles, StreamingRewardConfig(max_inflight=1))
+    worker.async_reward_client = create_async_reward_client(handles, StreamingRewardConfig(max_inflight=1))
 
     async def prompt():
         data = DataProto.from_dict(tensors={"responses": torch.zeros(1, 1)})
-        published.append(await worker.streaming_reward_client.compute_score(data))
+        async with worker.async_reward_client.sample_slot():
+            published.append(await worker.async_reward_client.compute_score(data))
 
     first = asyncio.create_task(prompt())
     await entered.wait()

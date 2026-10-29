@@ -26,8 +26,9 @@ from PIL import Image
 from verl.protocol import DataProto
 from verl.single_controller.ray import RayResourcePool
 
+from verl_omni.pipelines.rollout_media import MediaArtifact, MediaSpec, artifact_fields
 from verl_omni.reward_loop.reward_loop import OmniRewardLoopManager
-from verl_omni.reward_loop.streaming import StreamingRewardClient
+from verl_omni.reward_loop.streaming import create_async_reward_client
 from verl_omni.workers.config.reward import get_streaming_reward_config
 
 
@@ -41,24 +42,39 @@ def main():
     config.actor_rollout_ref.model.tokenizer_path = str(Path(config.actor_rollout_ref.model.path) / "tokenizer")
     rows = [json.loads(line) for line in (args.run / "rollouts/1.jsonl").read_text().splitlines()]
     images = [torch.from_numpy(np.array(Image.open(row["output"]).convert("RGB"))).permute(2, 0, 1) for row in rows]
-    data = DataProto.from_dict(
-        tensors={"responses": torch.stack(images)},
-        non_tensors={
-            "data_source": np.array(["same_image_parity"] * len(rows)),
-            "reward_model": np.array([{"ground_truth": row["gts"]} for row in rows], dtype=object),
-            "extra_info": np.array([{} for _ in rows], dtype=object),
-        },
-    )
-    ray.init(num_cpus=12, num_gpus=1, include_dashboard=False, object_store_memory=256 * 1024 * 1024)
+    samples = []
+    for row, image in zip(rows, images, strict=True):
+        fields = artifact_fields(
+            {"image_preview": MediaArtifact(MediaSpec("image", "decoded", "CHW"), image)},
+            "image_preview",
+            "image_preview",
+        )
+        samples.append(
+            DataProto.from_dict(
+                tensors={"responses": image.unsqueeze(0)},
+                non_tensors={
+                    "data_source": ["same_image_parity"],
+                    "reward_model": [{"ground_truth": row["gts"]}],
+                    "tool_extra_fields": [fields],
+                },
+            )
+        )
+    data = DataProto.concat(samples)
+    ray.init(address="local", num_cpus=4, num_gpus=1, include_dashboard=False, object_store_memory=256 * 1024 * 1024)
     try:
         pool = RayResourcePool([1], use_gpu=True, max_colocate_count=2, name_prefix="parity_reward")
         manager = OmniRewardLoopManager(config, rm_resource_pool=pool)
 
         async def compare():
-            client = StreamingRewardClient(manager.reward_loop_worker_handles, get_streaming_reward_config(config))
+            client = create_async_reward_client(manager.reward_loop_worker_handles, get_streaming_reward_config(config))
             try:
                 batch = await manager.async_compute_rm_score(data)
-                streamed = await asyncio.gather(*(client.compute_score(data[i : i + 1]) for i in range(len(data))))
+
+                async def score(sample):
+                    async with client.sample_slot():
+                        return await client.compute_score(sample)
+
+                streamed = await asyncio.gather(*(score(data[i : i + 1]) for i in range(len(data))))
                 scores = torch.tensor([item["reward_score"] for item in streamed])
                 torch.testing.assert_close(scores, batch.batch["rm_scores"].flatten(), rtol=1e-5, atol=1e-6)
                 for i, item in enumerate(streamed):
