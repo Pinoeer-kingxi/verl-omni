@@ -43,6 +43,22 @@ def run_diffusion_v1(config, task_runner_class=None) -> None:
         task_runner_class: For recipe to change TaskRunner.
     """
     streaming_reward_enabled(config)
+    if get_streaming_reward_config(config).enabled:
+        manager_class_fqn = OmegaConf.select(config, "actor_rollout_ref.rollout.agent.agent_loop_manager_class")
+        if manager_class_fqn:
+            from verl_omni.agent_loop.diffusion_agent_loop_tq import DiffusionAgentLoopManagerTQ
+
+            manager_cls = load_class_from_fqn(manager_class_fqn, "AgentLoopManager")
+            if not (
+                isinstance(manager_cls, type)
+                and issubclass(manager_cls, DiffusionAgentLoopManagerTQ)
+                and callable(manager_cls.create)
+                and callable(manager_cls.raise_if_reward_failed)
+            ):
+                raise ValueError(
+                    "Named reward streaming requires agent_loop_manager_class to extend "
+                    "DiffusionAgentLoopManagerTQ with callable create and raise_if_reward_failed methods"
+                )
     # Reject unsupported profiling combinations before starting Ray or workers.
     if OmegaConf.select(config, "global_profiler.steps"):
         if (

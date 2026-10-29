@@ -76,6 +76,7 @@ def create_async_reward_client(
                 "media_kind",
                 "audio",
                 "audio_sample_rate",
+                "img_shapes",
             }
             projected = [
                 {key: value for key, value in fields.items() if key in retained or key.startswith(ARTIFACT_PREFIX)}

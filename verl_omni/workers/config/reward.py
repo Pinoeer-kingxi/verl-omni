@@ -64,7 +64,7 @@ class StreamingRewardConfig(BaseConfig):
     enabled: bool = False
     # Maximum samples generating or scoring per agent worker, including draining requests.
     max_inflight: int = 8
-    # Per-sample deadline in seconds from the start of scoring; null disables it.
+    # Score expiry in seconds from scoring start; null disables it. Accepted RPCs still drain before returning.
     timeout: float | None = None
     # Optional generated fields sent to named groups; media fields are always retained. Null keeps all fields.
     extra_fields: list[str] | None = None

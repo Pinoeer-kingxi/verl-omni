@@ -46,7 +46,7 @@ def test_streaming_validates_extra_field_selection(keys):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("keys", [None, [], ["keep", "optional"]])
 async def test_named_payload_projection_preserves_inputs_and_other_metadata(keys):
-    fields = {"keep": torch.tensor([2]), "trajectory": torch.ones(128)}
+    fields = {"keep": torch.tensor([2]), "trajectory": torch.ones(128), "img_shapes": [(1, 32, 48)]}
     data = DataProto.from_dict(
         tensors={"responses": torch.tensor([[1]])},
         non_tensors={"tool_extra_fields": np.array([fields], dtype=object), "extra_info": np.array([{"index": 7}])},
@@ -66,9 +66,10 @@ async def test_named_payload_projection_preserves_inputs_and_other_metadata(keys
     try:
         result = await _score_sample(client, data)
         assert result["reward_score"] == 2.0
-        expected = set(fields) if keys is None else set(fields).intersection(keys)
+        expected = set(fields) if keys is None else set(fields).intersection([*keys, "img_shapes"])
         assert [set(value) for value in seen] == [expected, expected]
-        assert set(data.non_tensor_batch["tool_extra_fields"][0]) == {"keep", "trajectory"}
+        assert all(value["img_shapes"] == fields["img_shapes"] for value in seen)
+        assert set(data.non_tensor_batch["tool_extra_fields"][0]) == {"keep", "trajectory", "img_shapes"}
         assert data.non_tensor_batch["tool_extra_fields"][0] is fields
     finally:
         await client.close()
@@ -246,8 +247,55 @@ def test_omni_entrypoint_rejects_diffusion_streaming_mode_before_ray(monkeypatch
 
     config = _config({"quality": {"backend": "native", "offload": False}}, enabled=True)
     monkeypatch.setattr(main_omni.ray, "is_initialized", lambda: pytest.fail("Ray must not start"))
-    with pytest.raises(ValueError, match="V1 synchronous diffusion training"):
+    with pytest.raises(ValueError, match="Omni entrypoint does not support named reward streaming"):
         main_omni.run_omni(config)
+
+
+@pytest.mark.parametrize("missing", ["diffusion_base", "create", "raise_if_reward_failed"])
+def test_incompatible_streaming_manager_rejected_before_ray(monkeypatch, missing):
+    """Reject incompatible custom managers before any distributed initialization."""
+    from verl.trainer.ppo.v1 import AgentLoopManagerTQ
+
+    from verl_omni.agent_loop.diffusion_agent_loop_tq import DiffusionAgentLoopManagerTQ
+    from verl_omni.trainer import main_diffusion_v1
+
+    class CustomManager(DiffusionAgentLoopManagerTQ):
+        pass
+
+    manager_cls = AgentLoopManagerTQ if missing == "diffusion_base" else CustomManager
+    if missing != "diffusion_base":
+        setattr(manager_cls, missing, None)
+    config = _config({"quality": {"backend": "native", "offload": False}}, enabled=True)
+    OmegaConf.update(config, "actor_rollout_ref.rollout.agent.agent_loop_manager_class", "custom.Manager")
+    monkeypatch.setattr(main_diffusion_v1, "load_class_from_fqn", lambda *_: manager_cls)
+    monkeypatch.setattr(main_diffusion_v1.ray, "is_initialized", lambda: pytest.fail("Ray must not start"))
+    with pytest.raises(ValueError, match="DiffusionAgentLoopManagerTQ.*callable"):
+        main_diffusion_v1.run_diffusion_v1(config)
+
+
+@pytest.mark.parametrize(("enabled", "named"), [(True, True), (False, True), (False, False)])
+def test_streaming_manager_check_preserves_supported_customization(monkeypatch, enabled, named):
+    """Accept diffusion subclasses and leave non-streaming manager selection unrestricted."""
+    from verl_omni.agent_loop.diffusion_agent_loop_tq import DiffusionAgentLoopManagerTQ
+    from verl_omni.trainer import main_diffusion_v1
+
+    class CustomManager(DiffusionAgentLoopManagerTQ):
+        pass
+
+    config = _config({"quality": {"backend": "native", "offload": False}}, enabled=enabled)
+    if not named:
+        config.reward.models = {}
+    config.transfer_queue = {"enable": True}
+    OmegaConf.update(config, "actor_rollout_ref.rollout.agent.agent_loop_manager_class", "custom.Manager")
+    monkeypatch.setattr(main_diffusion_v1, "load_class_from_fqn", lambda *_: CustomManager if enabled else object)
+    monkeypatch.setattr(main_diffusion_v1, "enable_rl_insight", lambda _: None)
+
+    def reached_ray():
+        raise RuntimeError("manager validation passed")
+
+    monkeypatch.setattr(main_diffusion_v1.ray, "is_initialized", reached_ray)
+    with pytest.raises(RuntimeError, match="manager validation passed"):
+        main_diffusion_v1.run_diffusion_v1(config)
 
 
 @pytest.mark.parametrize(

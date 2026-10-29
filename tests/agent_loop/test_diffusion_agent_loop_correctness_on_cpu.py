@@ -18,7 +18,9 @@ from unittest.mock import AsyncMock
 
 import numpy as np
 import pytest
+import ray
 import torch
+from omegaconf import OmegaConf
 from tensordict import NonTensorData, NonTensorStack, TensorDict
 from verl.experimental.agent_loop.agent_loop import AgentLoopMetrics
 from verl.protocol import DataProto
@@ -73,6 +75,46 @@ async def test_factory_and_class_creation_use_diffusion_tq_workers(monkeypatch, 
     monkeypatch.setattr(DiffusionAgentLoopManagerTQ, "_init_agent_loop_workers", init_workers)
     manager = await create()
     assert manager.agent_loop_workers == ["diffusion_worker"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("worker_kind", ["diffusion", "custom", "missing_close", "missing_error_check"])
+async def test_streaming_worker_contract_checked_before_allocation(monkeypatch, enabled, worker_kind):
+    """Validate the selected Ray worker before delegating actor allocation upstream."""
+
+    class CustomWorker(DiffusionAgentLoopWorkerTQ.__ray_actor_class__):
+        pass
+
+    if worker_kind == "missing_close":
+        CustomWorker.close_reward_streaming = None
+    elif worker_kind == "missing_error_check":
+        CustomWorker.raise_if_reward_failed = None
+    worker_cls = DiffusionAgentLoopWorkerTQ if worker_kind == "diffusion" else ray.remote(CustomWorker)
+    manager = object.__new__(DiffusionAgentLoopManagerTQ)
+    manager.config = OmegaConf.create(
+        {
+            "reward": {
+                "streaming": {"_target_": "verl_omni.workers.config.reward.StreamingRewardConfig", "enabled": enabled}
+            }
+        }
+    )
+    manager.agent_loop_workers_class = worker_cls
+    allocations = []
+
+    async def allocate(self):
+        allocations.append(self.agent_loop_workers_class)
+        self.agent_loop_workers = []
+
+    monkeypatch.setattr(diffusion_agent_loop_tq.AgentLoopManagerTQ, "_init_agent_loop_workers", allocate)
+    if enabled and worker_kind.startswith("missing"):
+        with pytest.raises(ValueError, match="agent workers with callable"):
+            await manager._init_agent_loop_workers()
+        assert not allocations
+    else:
+        await manager._init_agent_loop_workers()
+        assert allocations == [worker_cls]
+        assert manager.agent_loop_workers == []
 
 
 class _FakeRewardLoopWorkerHandle:

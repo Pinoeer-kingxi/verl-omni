@@ -343,7 +343,10 @@ def run_omni(config, task_runner_class=None) -> None:
     """Initialize Ray and run distributed Omni training."""
     streaming_reward_enabled(config)
     if get_streaming_reward_config(config).enabled:
-        raise ValueError("Named reward streaming requires V1 synchronous diffusion training")
+        raise ValueError(
+            "The Omni entrypoint does not support named reward streaming; "
+            "use verl_omni.trainer.main_diffusion_v1 for V1 synchronous diffusion training"
+        )
     enable_rl_insight(config)
 
     if uses_v1_trainer(config):

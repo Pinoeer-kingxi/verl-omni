@@ -30,6 +30,13 @@ from verl_omni.reward_loop.streaming import create_async_reward_client
 from verl_omni.workers.config.reward import StreamingRewardConfig
 
 
+def score_image_shapes(data_source, solution_image, ground_truth, extra_info):
+    """Require pipeline geometry at the real reward worker's scorer boundary."""
+    shapes = extra_info["img_shapes"]
+    assert shapes == [(1, 4, 6), (1, 8, 8)]
+    return {"score": float(sum(height * width for _, height, width in shapes))}
+
+
 @pytest.mark.asyncio
 async def test_real_ray_named_media_matches_batch_and_rejects_invalid_preview():
     """Exercise serialization and both worker entrypoints with an optional scorer."""
@@ -54,7 +61,13 @@ async def test_real_ray_named_media_matches_batch_and_rejects_invalid_preview():
                         "name": "compute_score",
                         "weight": 0.3,
                         "required": False,
-                    }
+                    },
+                    "geometry": {
+                        "path": str(Path(__file__).resolve()),
+                        "name": "score_image_shapes",
+                        "weight": 0.7,
+                        "required": True,
+                    },
                 }
             )
             worker = ray.remote(OmniRewardLoopWorker).options(num_cpus=1).remote(config)
@@ -71,6 +84,7 @@ async def test_real_ray_named_media_matches_batch_and_rejects_invalid_preview():
                     "image_latent",
                     "image_preview",
                 )
+                fields["img_shapes"] = [(1, 4, 6), (1, 8, 8)]
                 sample = DataProto.from_dict(
                     tensors={"responses": latent.unsqueeze(0)},
                     non_tensors={
@@ -80,6 +94,7 @@ async def test_real_ray_named_media_matches_batch_and_rejects_invalid_preview():
                     },
                 )
                 batch = await worker.compute_score_batch.remote(sample)
+                assert batch[0]["reward_extra_info"]["reward/geometry"] == 88.0
                 async with client.sample_slot():
                     assert await client.compute_score(sample) == batch[0]
                 fields["preview_artifact"] = "absent"

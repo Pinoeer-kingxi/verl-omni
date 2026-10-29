@@ -1,7 +1,7 @@
 (async_reward)=
 # Async Reward for Diffusion Training
 
-Last updated: 10/28/2026.
+Last updated: 10/29/2026.
 
 Async reward lets VeRL-Omni score completed rollout samples through reward-loop
 workers while other samples are still being generated. It is useful when reward
@@ -137,8 +137,9 @@ replicas.
 
 For named streaming, the agent holds `sample_slot()` from generation through
 scoring and drain. Scoring does not acquire another slot. The client applies the
-configured scoring deadline and retains ownership of accepted requests after
-cancellation or timeout. The V1 runner waits for agent shutdown before closing
+configured score expiry and retains ownership of accepted requests after
+cancellation or timeout. The timeout discards late scores; it does not abort RPCs
+or bound return time. The V1 runner waits for agent shutdown before closing
 native reward models and TransferQueue. See
 [Named Reward Models](named_reward_models.md#sample-level-streaming) for supported
 placement, admission bounds, and failure behavior.

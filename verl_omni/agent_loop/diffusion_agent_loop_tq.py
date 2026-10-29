@@ -40,6 +40,7 @@ from verl_omni.pipelines.rollout_media import (
     ArtifactContractError,
 )
 from verl_omni.reward_loop.reward_model_executor import _await_owned
+from verl_omni.workers.config.reward import get_streaming_reward_config
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
@@ -348,6 +349,18 @@ class DiffusionAgentLoopManagerTQ(AgentLoopManagerTQ):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.agent_loop_workers_class = DiffusionAgentLoopWorkerTQ
+
+    async def _init_agent_loop_workers(self):
+        if get_streaming_reward_config(self.config).enabled:
+            if not all(
+                callable(getattr(self.agent_loop_workers_class, method, None))
+                for method in ("raise_if_reward_failed", "close_reward_streaming")
+            ):
+                raise ValueError(
+                    "Named reward streaming requires agent workers with callable "
+                    "raise_if_reward_failed and close_reward_streaming methods"
+                )
+        await super()._init_agent_loop_workers()
 
     def raise_if_reward_failed(self) -> None:
         """Check all workers before sampled trajectories reach training or validation."""

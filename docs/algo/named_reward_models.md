@@ -1,6 +1,6 @@
 # Named Reward Models
 
-Last updated: 10/28/2026.
+Last updated: 10/29/2026.
 
 This guide describes how to configure and extend named model-backed rewards
 under `reward.models` in `verl-omni`. For the general Reward Loop interface and
@@ -639,9 +639,11 @@ reward:
       offload: false
 ```
 
-This path supports V1 synchronous policy-gradient training with scalar
-`weighted_sum` rewards. All named models must use the native backend,
-`offload: false`, accelerator placement, and a dedicated reward resource pool.
+This path requires a nonempty `reward.models` mapping and supports V1 synchronous
+policy-gradient training with scalar `weighted_sum` rewards. Function-only groups
+can accompany named models but do not satisfy this requirement alone. All named
+models must use the native backend, `offload: false`, accelerator placement, and
+a dedicated reward resource pool.
 CPU placement, direct-preference and component-reward modes, other trainers,
 engine-backed rewards, and shared pools
 are rejected before worker allocation. Models are woken when the reward manager
@@ -652,11 +654,18 @@ weights, raw term diagnostics, and `required` failure handling are unchanged.
 The group merge is shared with
 batch scoring. The trainer still collects a full scored batch before updating.
 
+Custom `actor_rollout_ref.rollout.agent.agent_loop_manager_class` implementations
+must extend `DiffusionAgentLoopManagerTQ`, retaining its worker initialization,
+error checks and shutdown contract. Incompatible managers are rejected before
+Ray starts. Custom agent workers must expose callable `raise_if_reward_failed`
+and `close_reward_streaming` methods; these are checked before agent allocation.
+
 `streaming.extra_fields` selects optional generated `tool_extra_fields` sent to
 every named reward group. The default `null` forwards all fields. Named media
-tensors, declarations, selectors and context, plus legacy media metadata, are
-always retained. `[]` excludes training-only trajectory and embedding fields;
-include any such fields required by a configured scorer. Dataset `extra_info`,
+tensors, declarations, selectors and context, plus `media_kind`, `audio`,
+`audio_sample_rate` and `img_shapes`, are always retained. `[]` excludes
+training-only trajectory and embedding fields; include any such fields required
+by a configured scorer. Dataset `extra_info`,
 responses and the original training trajectory are preserved. This selection
 applies only to named streaming. Media contract errors remain fatal, including
 for optional rewards: the agent records the first error, and training or
@@ -677,11 +686,12 @@ fan-outs, or A * max_inflight * G group RPCs, are admitted. This is not a global
 replica scheduler or a bound on scored trajectories retained by prompt groups
 and replay buffers. Existing backend batching remains in charge of execution.
 
-`timeout` is an optional scoring deadline in seconds; it starts when scoring
-begins, after generation and admission. Cancellation or timeout discards the
-result. Accepted group RPCs settle before their slot is released or the error
-returns. The deadline therefore does not bound cleanup time: a hung backend
-requires its existing backend/worker termination policy. There are no automatic
+`timeout` is an optional score expiry in seconds, measured from scoring start
+after generation and admission. It is not an RPC abort or a return-time limit.
+Cancellation or timeout discards the result. Accepted group RPCs settle before
+their slot is released or the error returns. Waiting can therefore exceed
+`timeout`: a hung backend requires its existing backend/worker termination policy.
+There are no automatic
 retries. Optional scorer failures still contribute zero with their existing
 diagnostics; required failures follow the trainer's existing failed-sample
 policy, including replay-buffer replacement only when configured.
