@@ -32,7 +32,13 @@ from verl_omni.agent_loop.diffusion_agent_loop import (
     _InternalDiffusionAgentLoopOutput,
 )
 from verl_omni.agent_loop.utils import derive_rollout_seed
-from verl_omni.pipelines.rollout_media import ARTIFACT_CONTEXT, ARTIFACT_SPECS, PREVIEW_ARTIFACT, PRIMARY_ARTIFACT
+from verl_omni.pipelines.rollout_media import (
+    ARTIFACT_CONTEXT,
+    ARTIFACT_SPECS,
+    PREVIEW_ARTIFACT,
+    PRIMARY_ARTIFACT,
+    ArtifactContractError,
+)
 from verl_omni.reward_loop.reward_model_executor import _await_owned
 
 logger = logging.getLogger(__name__)
@@ -47,6 +53,12 @@ class DiffusionAgentLoopWorkerTQ(DiffusionAgentLoopWorker):
         super().__init__(*args, **kwargs)
         tq.init()
         self.background_tasks = set()
+        self._fatal_reward_error: str | None = None
+
+    def raise_if_reward_failed(self) -> None:
+        """Surface fatal background scoring errors at the trainer's sampling boundary."""
+        if self._fatal_reward_error is not None:
+            raise ArtifactContractError(self._fatal_reward_error)
 
     async def close_reward_streaming(self) -> None:
         """Cancel unfinished prompts and drain accepted reward work before teardown."""
@@ -58,6 +70,7 @@ class DiffusionAgentLoopWorkerTQ(DiffusionAgentLoopWorker):
 
     async def generate_sequences(self, batch: TensorDict) -> None:
         """Spawn diffusion agent loops for each prompt in the batch without waiting."""
+        self.raise_if_reward_failed()
         validate = batch["validate"] if "validate" in batch else False
         if isinstance(validate, NonTensorData):
             validate = validate.data
@@ -177,6 +190,10 @@ class DiffusionAgentLoopWorkerTQ(DiffusionAgentLoopWorker):
                     f"Error in _run_prompt for uid={uid}",
                     exc_info=(type(error), error, error.__traceback__),
                 )
+            if self.async_reward_client is not None and self.async_reward_client.requires_drain:
+                for error in errors:
+                    if isinstance(error, ArtifactContractError):
+                        raise error
             # One put per prompt group instead of one per session: every TQ put
             # is a ZMQ roundtrip carrying the full image payload, and the
             # replay buffer waits for the whole group anyway, so per-session
@@ -194,6 +211,13 @@ class DiffusionAgentLoopWorkerTQ(DiffusionAgentLoopWorker):
             await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": status})
         except Exception as e:
             logger.exception(f"Error in _run_prompt for uid={uid}: {e}")
+            if (
+                isinstance(e, ArtifactContractError)
+                and self.async_reward_client is not None
+                and self.async_reward_client.requires_drain
+                and self._fatal_reward_error is None
+            ):
+                self._fatal_reward_error = str(e)
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
             await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": "failure"})
@@ -324,6 +348,10 @@ class DiffusionAgentLoopManagerTQ(AgentLoopManagerTQ):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.agent_loop_workers_class = DiffusionAgentLoopWorkerTQ
+
+    def raise_if_reward_failed(self) -> None:
+        """Check all workers before sampled trajectories reach training or validation."""
+        ray.get([worker.raise_if_reward_failed.remote() for worker in self.agent_loop_workers])
 
     def generate_sequences(self, prompts: TensorDict) -> None:
         """Dispatch prompts and settle accepted RPCs before returning or raising."""

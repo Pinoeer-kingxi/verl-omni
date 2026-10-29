@@ -659,7 +659,10 @@ always retained. `[]` excludes training-only trajectory and embedding fields;
 include any such fields required by a configured scorer. Dataset `extra_info`,
 responses and the original training trajectory are preserved. This selection
 applies only to named streaming. Media contract errors remain fatal, including
-for optional rewards; see the [media contract](../advanced/diffusion_media_artifacts.md).
+for optional rewards: the agent records the first error, and training or
+validation raises it at the replay sampling boundary before consuming results.
+Failed groups are not refilled after a contract error. See the
+[media contract](../advanced/diffusion_media_artifacts.md).
 
 Streaming is disabled by default. Early scoring may hide reward latency, but
 smaller inference batches can reduce GPU utilization. Keep the batch path unless

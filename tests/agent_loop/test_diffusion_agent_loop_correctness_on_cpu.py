@@ -37,6 +37,7 @@ from verl_omni.agent_loop.diffusion_agent_loop_tq import (
     create_diffusion_agent_loop_manager,
 )
 from verl_omni.agent_loop.single_turn_agent_loop import DiffusionSingleTurnAgentLoop
+from verl_omni.pipelines.rollout_media import ArtifactContractError
 from verl_omni.reward_loop.streaming import create_async_reward_client
 from verl_omni.trainer.diffusion.v1 import tq_utils
 from verl_omni.workers.config.reward import StreamingRewardConfig
@@ -325,6 +326,8 @@ async def test_run_prompt_batches_prompt_group_into_one_put(monkeypatch):
     """All of a prompt's session rows must land in a single batched TQ put."""
     worker_cls = DiffusionAgentLoopWorkerTQ.__ray_metadata__.modified_class
     worker = object.__new__(worker_cls)
+    worker._fatal_reward_error = None
+    worker.async_reward_client = None
     worker.rollout_config = SimpleNamespace(n=2, val_kwargs=SimpleNamespace(n=2))
 
     def make_output(*, with_log_probs: bool):
@@ -445,21 +448,29 @@ def test_tq_batch_restores_non_tensor_trajectory_metadata(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_run_prompt_publishes_failure_after_siblings_settle(monkeypatch):
+@pytest.mark.parametrize("named", [False, True])
+@pytest.mark.parametrize("failure", [RuntimeError, ArtifactContractError])
+async def test_run_prompt_publishes_failure_after_siblings_settle(monkeypatch, named, failure):
     worker_cls = DiffusionAgentLoopWorkerTQ.__ray_metadata__.modified_class
     worker = object.__new__(worker_cls)
+    worker._fatal_reward_error = None
+    worker.async_reward_client = None
     worker.rollout_config = SimpleNamespace(n=2, val_kwargs=SimpleNamespace(n=2))
+    worker.async_reward_client = SimpleNamespace(requires_drain=named)
     lifecycle = []
 
     async def fake_kv_put(*, key, partition_id, tag):
         assert key == "sample"
         assert partition_id == "train"
+        if tag["status"] == "failure" and named and failure is ArtifactContractError:
+            with pytest.raises(ArtifactContractError, match="session failed"):
+                worker.raise_if_reward_failed()
         lifecycle.append(tag["status"])
 
     async def fake_run_agent_loop(self, sampling_params, *, session_id, **kwargs):
         del self, sampling_params, kwargs
         if session_id == 0:
-            raise RuntimeError("session failed")
+            raise failure("session failed")
         await asyncio.sleep(0.01)
         lifecycle.append("sibling_settled")
 
@@ -482,8 +493,17 @@ async def test_run_prompt_publishes_failure_after_siblings_settle(monkeypatch):
         prompt_index=0,
     )
 
-    assert lifecycle == ["running", "sibling_settled", "written", "failure"]
-    assert [session_id for session_id, _output in written[0]] == [1]
+    if named and failure is ArtifactContractError:
+        assert lifecycle == ["running", "sibling_settled", "failure"]
+        assert not written
+        # Refill cannot dispatch more work after a fatal contract failure.
+        with pytest.raises(ArtifactContractError, match="session failed"):
+            await worker.generate_sequences(TensorDict({}, batch_size=[0]))
+        assert not written
+    else:
+        assert lifecycle == ["running", "sibling_settled", "written", "failure"]
+        assert [session_id for session_id, _output in written[0]] == [1]
+        worker.raise_if_reward_failed()
 
 
 @pytest.mark.asyncio
@@ -498,6 +518,8 @@ async def test_generate_sequences_seeds_from_global_prompt_index(monkeypatch):
     worker_cls = DiffusionAgentLoopWorkerTQ.__ray_metadata__.modified_class
     worker = object.__new__(worker_cls)
     worker.background_tasks = set()
+    worker._fatal_reward_error = None
+    worker.async_reward_client = None
     worker.rollout_config = SimpleNamespace(
         n=2,
         pipeline={},

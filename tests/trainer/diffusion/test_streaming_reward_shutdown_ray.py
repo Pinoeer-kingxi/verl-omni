@@ -41,6 +41,7 @@ class GatedAgent(DiffusionAgentLoopWorkerTQ.__ray_metadata__.modified_class):
         )
         self.async_reward_client = create_async_reward_client({}, StreamingRewardConfig())
         self.background_tasks = set()
+        self._fatal_reward_error = None
         self.gate = asyncio.Event()
         self.prompt_gate = asyncio.Event()
         self.blocked = False
